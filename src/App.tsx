@@ -1,6 +1,8 @@
 import { createSignal, createResource, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-opener";
+import { type } from "@tauri-apps/plugin-os";
+import { check } from "@tauri-apps/plugin-updater";
 import "./App.css";
 
 type View = "dashboard" | "students" | "teachers" | "schools";
@@ -72,15 +74,27 @@ export default function App() {
 
   const checkForUpdates = async () => {
     try {
-      const res: any = await invoke("check_updates");
-      if (res.available && res.download_url) {
-        if (confirm(`New update (v${res.version}) available! Would you like to download it?`)) {
-          // On Android, this opens Chrome -> Downloads APK -> Android Prompts to Install
-          // On Desktop, this downloads the installer
-          await open(res.download_url);
+      const osType = type();
+      
+      if (osType === "android") {
+        const res: any = await invoke("check_updates");
+        if (res.available && res.download_url) {
+          if (confirm(`New update (v${res.version}) available! Would you like to download it?`)) {
+            await open(res.download_url);
+          }
+        } else {
+          alert("You are on the latest version!");
         }
       } else {
-        alert("You are on the latest version!");
+        const update = await check();
+        if (update) {
+          if (confirm(`Update ${update.version} available! Install and restart?`)) {
+            await update.downloadAndInstall();
+            alert("Update installed successfully. Please restart the app.");
+          }
+        } else {
+          alert("You are on the latest version!");
+        }
       }
     } catch(err) {
       console.error("Update error: ", err);

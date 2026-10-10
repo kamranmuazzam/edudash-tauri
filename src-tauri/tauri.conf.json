@@ -31,5 +31,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCOUEyNDJBRDVDRTdGNjIKUldSaWY4N1ZLaVNhYStnN25DV1JxbnJSUkFyaWxlSjNRbmhGYVBrN1VnNWZEZ09IUUdxNVZ2bVYK",
+      "endpoints": [
+        "https://github.com/kamranmuazzam/edudash-tauri/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
