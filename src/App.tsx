@@ -1,6 +1,6 @@
 import { createSignal, createResource, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { type } from "@tauri-apps/plugin-os";
 import { check } from "@tauri-apps/plugin-updater";
 import "./App.css";
@@ -80,7 +80,7 @@ export default function App() {
         const res: any = await invoke("check_updates");
         if (res.available && res.download_url) {
           if (confirm(`New update (v${res.version}) available! Would you like to download it?`)) {
-            await open(res.download_url);
+            await openUrl(res.download_url);
           }
         } else {
           alert("You are on the latest version!");
