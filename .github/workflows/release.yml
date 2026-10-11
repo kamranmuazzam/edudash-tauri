@@ -117,3 +117,16 @@ jobs:
           tag_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
