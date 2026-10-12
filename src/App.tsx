@@ -27,6 +27,12 @@ interface UpdateState {
 
 export default function App() {
   const [currentView, setCurrentView] = createSignal<View>("dashboard");
+  const [searchQuery, setSearchQuery] = createSignal("");
+
+  const handleViewChange = (view: View) => {
+    setCurrentView(view);
+    setSearchQuery("");
+  };
 
   // Theme Management (Defaults to Light theme, persistent)
   const storedTheme = (typeof window !== "undefined" && localStorage.getItem("edudash-theme") as Theme) || "light";
@@ -58,6 +64,28 @@ export default function App() {
   const [schools] = createResource(trigger, async () => {
     return await invoke<School[]>("get_schools");
   });
+
+  // Filtered views for search
+  const filteredSchools = () => {
+    const list = schools() || [];
+    const q = searchQuery().toLowerCase().trim();
+    if (!q) return list;
+    return list.filter(s => s.name.toLowerCase().includes(q) || s.address.toLowerCase().includes(q));
+  };
+
+  const filteredTeachers = () => {
+    const list = teachers() || [];
+    const q = searchQuery().toLowerCase().trim();
+    if (!q) return list;
+    return list.filter(t => t.name.toLowerCase().includes(q) || t.subject.toLowerCase().includes(q));
+  };
+
+  const filteredStudents = () => {
+    const list = students() || [];
+    const q = searchQuery().toLowerCase().trim();
+    if (!q) return list;
+    return list.filter(s => s.name.toLowerCase().includes(q) || s.grade.toLowerCase().includes(q));
+  };
 
   // Modal State for Records
   const [isModalOpen, setIsModalOpen] = createSignal(false);
@@ -165,7 +193,7 @@ export default function App() {
             isOpen: true,
             status: "available",
             version: update.version,
-            body: update.body || "A new update of EduDash is available with the latest features.",
+            body: update.body || "A new update of EduDash is available with the latest features and improvements.",
             date: update.date,
             progress: 0,
           });
@@ -269,14 +297,14 @@ export default function App() {
           <div class="logo-icon">EDU</div>
           <div class="logo-info">
             <span class="logo-text">EduDash</span>
-            <span class="logo-version">v1.0.7</span>
+            <span class="logo-version">v1.0.8</span>
           </div>
         </div>
         
         <nav class="nav-links">
           <button 
             class={`nav-item ${currentView() === "dashboard" ? "active" : ""}`}
-            onClick={() => setCurrentView("dashboard")}
+            onClick={() => handleViewChange("dashboard")}
           >
             <span class="nav-item-icon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -290,7 +318,7 @@ export default function App() {
           </button>
           <button 
             class={`nav-item ${currentView() === "schools" ? "active" : ""}`}
-            onClick={() => setCurrentView("schools")}
+            onClick={() => handleViewChange("schools")}
           >
             <span class="nav-item-icon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -301,7 +329,7 @@ export default function App() {
           </button>
           <button 
             class={`nav-item ${currentView() === "teachers" ? "active" : ""}`}
-            onClick={() => setCurrentView("teachers")}
+            onClick={() => handleViewChange("teachers")}
           >
             <span class="nav-item-icon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -314,7 +342,7 @@ export default function App() {
           </button>
           <button 
             class={`nav-item ${currentView() === "students" ? "active" : ""}`}
-            onClick={() => setCurrentView("students")}
+            onClick={() => handleViewChange("students")}
           >
             <span class="nav-item-icon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -329,6 +357,11 @@ export default function App() {
         </nav>
         
         <div class="sidebar-footer">
+          <div class="system-status-pill">
+            <span class="status-dot"></span>
+            <span>System Online • v1.0.8</span>
+          </div>
+
           <button 
             class="btn theme-toggle-btn" 
             onClick={toggleTheme}
@@ -379,23 +412,39 @@ export default function App() {
             </h1>
             <p class="page-subtitle">
               {currentView() === "dashboard" && "Welcome back! Here is a summary of your educational database."}
-              {currentView() === "schools" && "Create, monitor, and manage educational institutions."}
-              {currentView() === "teachers" && "View faculty profiles, subjects taught, and affiliated schools."}
-              {currentView() === "students" && "Keep track of active student enrollments and grade levels."}
+              {currentView() === "schools" && "Create, monitor, and search educational institutions."}
+              {currentView() === "teachers" && "View faculty profiles, search subjects taught, and manage schools."}
+              {currentView() === "students" && "Keep track of active student enrollments, search names and grades."}
             </p>
           </div>
           
           <Show when={currentView() !== "dashboard"}>
-            <button 
-              class="btn btn-primary"
-              onClick={() => openModal(`add_${currentView().slice(0,-1)}` as any)}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              <span>Add New</span>
-            </button>
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+              <div class="search-input-wrapper">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input 
+                  type="text" 
+                  class="search-input" 
+                  placeholder={`Search ${currentView()}...`}
+                  value={searchQuery()}
+                  onInput={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+
+              <button 
+                class="btn btn-primary"
+                onClick={() => openModal(`add_${currentView().slice(0,-1)}` as any)}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                <span>Add New</span>
+              </button>
+            </div>
           </Show>
         </header>
 
@@ -453,13 +502,13 @@ export default function App() {
 
           <div class="welcome-banner">
             <div class="welcome-text">
-              <h2>✨ EduDash v1.0.7 with Integrated Auto-Updater</h2>
+              <h2>✨ EduDash v1.0.8 - Auto-Update Verified!</h2>
               <p>
-                Manage schools, faculty, and students seamlessly with native Rust speed, light and dark themes, and real-time auto-updates.
+                Manage schools, faculty, and students with real-time instant search, responsive light and dark themes, and high-performance Rust backend.
               </p>
             </div>
             <div class="quick-actions">
-              <button class="btn btn-secondary" onClick={() => setCurrentView("schools")}>
+              <button class="btn btn-secondary" onClick={() => handleViewChange("schools")}>
                 View Schools
               </button>
               <button class="btn btn-primary" onClick={() => openModal("add_student")}>
@@ -473,7 +522,7 @@ export default function App() {
         <Show when={currentView() === "schools"}>
           <div class="crud-container table-wrapper">
             <Show 
-              when={schools() && schools()!.length > 0}
+              when={filteredSchools() && filteredSchools().length > 0}
               fallback={
                 <div class="empty-state">
                   <div class="empty-icon">
@@ -481,11 +530,13 @@ export default function App() {
                       <path d="M3 21h18M3 10h18M5 6l7-3 7 3M4 10v11M20 10v11"/>
                     </svg>
                   </div>
-                  <h3>No schools registered yet</h3>
-                  <p>Add your first educational institution to begin managing faculty and students.</p>
-                  <button class="btn btn-primary" onClick={() => openModal("add_school")}>
-                    + Add First School
-                  </button>
+                  <h3>{searchQuery() ? "No matching schools found" : "No schools registered yet"}</h3>
+                  <p>{searchQuery() ? `No results matching "${searchQuery()}".` : "Add your first educational institution to begin managing faculty and students."}</p>
+                  <Show when={!searchQuery()}>
+                    <button class="btn btn-primary" onClick={() => openModal("add_school")}>
+                      + Add First School
+                    </button>
+                  </Show>
                 </div>
               }
             >
@@ -499,7 +550,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  <For each={schools()}>
+                  <For each={filteredSchools()}>
                     {(school) => (
                       <tr>
                         <td>
@@ -525,7 +576,7 @@ export default function App() {
         <Show when={currentView() === "teachers"}>
           <div class="crud-container table-wrapper">
             <Show 
-              when={teachers() && teachers()!.length > 0}
+              when={filteredTeachers() && filteredTeachers().length > 0}
               fallback={
                 <div class="empty-state">
                   <div class="empty-icon">
@@ -534,11 +585,13 @@ export default function App() {
                       <circle cx="9" cy="7" r="4"/>
                     </svg>
                   </div>
-                  <h3>No teachers registered yet</h3>
-                  <p>Add teachers and assign them to specific school departments.</p>
-                  <button class="btn btn-primary" onClick={() => openModal("add_teacher")}>
-                    + Add First Teacher
-                  </button>
+                  <h3>{searchQuery() ? "No matching teachers found" : "No teachers registered yet"}</h3>
+                  <p>{searchQuery() ? `No results matching "${searchQuery()}".` : "Add teachers and assign them to specific school departments."}</p>
+                  <Show when={!searchQuery()}>
+                    <button class="btn btn-primary" onClick={() => openModal("add_teacher")}>
+                      + Add First Teacher
+                    </button>
+                  </Show>
                 </div>
               }
             >
@@ -553,7 +606,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  <For each={teachers()}>
+                  <For each={filteredTeachers()}>
                     {(teacher) => (
                       <tr>
                         <td>
@@ -584,7 +637,7 @@ export default function App() {
         <Show when={currentView() === "students"}>
           <div class="crud-container table-wrapper">
             <Show 
-              when={students() && students()!.length > 0}
+              when={filteredStudents() && filteredStudents().length > 0}
               fallback={
                 <div class="empty-state">
                   <div class="empty-icon">
@@ -593,11 +646,13 @@ export default function App() {
                       <circle cx="9" cy="7" r="4"/>
                     </svg>
                   </div>
-                  <h3>No students enrolled yet</h3>
-                  <p>Enroll students and track their academic grade levels and assigned school.</p>
-                  <button class="btn btn-primary" onClick={() => openModal("add_student")}>
-                    + Enroll First Student
-                  </button>
+                  <h3>{searchQuery() ? "No matching students found" : "No students enrolled yet"}</h3>
+                  <p>{searchQuery() ? `No results matching "${searchQuery()}".` : "Enroll students and track their academic grade levels and assigned school."}</p>
+                  <Show when={!searchQuery()}>
+                    <button class="btn btn-primary" onClick={() => openModal("add_student")}>
+                      + Enroll First Student
+                    </button>
+                  </Show>
                 </div>
               }
             >
@@ -612,7 +667,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  <For each={students()}>
+                  <For each={filteredStudents()}>
                     {(student) => (
                       <tr>
                         <td>
