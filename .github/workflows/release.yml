@@ -122,11 +122,10 @@ jobs:
     needs: build-tauri
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Publish Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: false
+        run: |
+          gh release edit "${{ github.ref_name }}" --draft=false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

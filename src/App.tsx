@@ -1,4 +1,4 @@
-import { createSignal, createResource, createEffect, For, Show } from "solid-js";
+import { createSignal, createResource, createEffect, onMount, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { type } from "@tauri-apps/plugin-os";
@@ -11,6 +11,19 @@ type Theme = "light" | "dark";
 interface Student { id: number; name: string; grade: string; school_id: number; }
 interface Teacher { id: number; name: string; subject: string; school_id: number; }
 interface School { id: number; name: string; address: string; }
+
+interface UpdateState {
+  checking: boolean;
+  isOpen: boolean;
+  status: "idle" | "checking" | "available" | "latest" | "downloading" | "ready" | "error";
+  version?: string;
+  body?: string;
+  date?: string;
+  progress?: number;
+  errorMessage?: string;
+  isAndroid?: boolean;
+  downloadUrl?: string;
+}
 
 export default function App() {
   const [currentView, setCurrentView] = createSignal<View>("dashboard");
@@ -46,7 +59,7 @@ export default function App() {
     return await invoke<School[]>("get_schools");
   });
 
-  // Modal State
+  // Modal State for Records
   const [isModalOpen, setIsModalOpen] = createSignal(false);
   const [modalType, setModalType] = createSignal<"add_student" | "add_teacher" | "add_school">("add_student");
   
@@ -88,35 +101,165 @@ export default function App() {
     }
   };
 
-  const checkForUpdates = async () => {
+  // =========================================================================
+  // In-App Auto-Updater State & Logic
+  // =========================================================================
+  const [updateState, setUpdateState] = createSignal<UpdateState>({
+    checking: false,
+    isOpen: false,
+    status: "idle",
+  });
+
+  let activeUpdateObj: any = null;
+
+  const closeUpdateModal = () => {
+    setUpdateState(prev => ({ ...prev, isOpen: false }));
+  };
+
+  const checkForUpdates = async (silent: boolean = false) => {
+    setUpdateState(prev => ({
+      ...prev,
+      checking: true,
+      status: "checking",
+      isOpen: silent ? prev.isOpen : true,
+      errorMessage: undefined,
+    }));
+
     try {
-      const osType = type();
-      
-      if (osType === "android") {
-        const res: any = await invoke("check_updates");
-        if (res.available && res.download_url) {
-          if (confirm(`New update (v${res.version}) available! Would you like to download it?`)) {
-            await openUrl(res.download_url);
-          }
-        } else {
-          alert("You are on the latest version!");
-        }
-      } else {
-        const update = await check();
-        if (update) {
-          if (confirm(`Update ${update.version} available! Install and restart?`)) {
-            await update.downloadAndInstall();
-            alert("Update installed successfully. Please restart the app.");
-          }
-        } else {
-          alert("You are on the latest version!");
+      let osType = "unknown";
+      try {
+        osType = type();
+      } catch {
+        if (typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("android")) {
+          osType = "android";
         }
       }
-    } catch(err) {
+
+      if (osType === "android") {
+        const res: any = await invoke("check_updates");
+        if (res && res.available && res.download_url) {
+          setUpdateState({
+            checking: false,
+            isOpen: true,
+            status: "available",
+            version: res.version,
+            isAndroid: true,
+            downloadUrl: res.download_url,
+            body: "A new version of EduDash for Android is ready to download.",
+          });
+        } else {
+          setUpdateState(prev => ({
+            ...prev,
+            checking: false,
+            status: "latest",
+            isOpen: silent ? false : true,
+          }));
+        }
+      } else {
+        // Desktop updater check via official Tauri plugin
+        const update = await check();
+        if (update && update.available) {
+          activeUpdateObj = update;
+          setUpdateState({
+            checking: false,
+            isOpen: true,
+            status: "available",
+            version: update.version,
+            body: update.body || "A new update of EduDash is available with the latest features.",
+            date: update.date,
+            progress: 0,
+          });
+        } else {
+          setUpdateState(prev => ({
+            ...prev,
+            checking: false,
+            status: "latest",
+            isOpen: silent ? false : true,
+          }));
+        }
+      }
+    } catch (err: any) {
       console.error("Update error: ", err);
-      alert("Error checking for updates: " + err);
+
+      // Attempt fallback to Rust backend command if plugin threw an error
+      try {
+        const fallback: any = await invoke("check_updates");
+        if (fallback && fallback.available && fallback.download_url) {
+          setUpdateState({
+            checking: false,
+            isOpen: true,
+            status: "available",
+            version: fallback.version,
+            downloadUrl: fallback.download_url,
+            body: "New release found on GitHub Releases.",
+          });
+          return;
+        }
+      } catch {
+        // Fallback also errored
+      }
+
+      setUpdateState(prev => ({
+        ...prev,
+        checking: false,
+        isOpen: silent ? false : true,
+        status: "error",
+        errorMessage: err?.message || String(err),
+      }));
     }
   };
+
+  const handleInstallUpdate = async () => {
+    if (updateState().isAndroid && updateState().downloadUrl) {
+      await openUrl(updateState().downloadUrl!);
+      closeUpdateModal();
+      return;
+    }
+
+    if (!activeUpdateObj) {
+      if (updateState().downloadUrl) {
+        await openUrl(updateState().downloadUrl!);
+        closeUpdateModal();
+      }
+      return;
+    }
+
+    try {
+      setUpdateState(prev => ({ ...prev, status: "downloading", progress: 0 }));
+      let downloaded = 0;
+      let totalBytes = 0;
+
+      await activeUpdateObj.downloadAndInstall((event: any) => {
+        if (event.event === "Started") {
+          totalBytes = event.data?.contentLength || 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data?.chunkLength || 0;
+          if (totalBytes > 0) {
+            const percent = Math.min(99, Math.round((downloaded / totalBytes) * 100));
+            setUpdateState(prev => ({ ...prev, progress: percent }));
+          }
+        } else if (event.event === "Finished") {
+          setUpdateState(prev => ({ ...prev, progress: 100 }));
+        }
+      });
+
+      setUpdateState(prev => ({ ...prev, status: "ready" }));
+    } catch (err: any) {
+      console.error("Failed to install update: ", err);
+      setUpdateState(prev => ({
+        ...prev,
+        status: "error",
+        errorMessage: "Installation failed: " + (err?.message || String(err)),
+      }));
+    }
+  };
+
+  // Automatic background update check on app launch
+  onMount(() => {
+    setTimeout(() => {
+      checkForUpdates(true);
+    }, 2500);
+  });
 
   return (
     <div class="app-container">
@@ -126,7 +269,7 @@ export default function App() {
           <div class="logo-icon">EDU</div>
           <div class="logo-info">
             <span class="logo-text">EduDash</span>
-            <span class="logo-version">v1.0.6</span>
+            <span class="logo-version">v1.0.7</span>
           </div>
         </div>
         
@@ -198,14 +341,28 @@ export default function App() {
             <span class="theme-toggle-badge">{theme() === "light" ? "Light" : "Dark"}</span>
           </button>
 
-          <button class="btn updater-btn" onClick={checkForUpdates}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <button 
+            class="btn updater-btn" 
+            onClick={() => checkForUpdates(false)}
+            disabled={updateState().checking}
+          >
+            <svg 
+              class={updateState().checking ? "spin-animation" : ""}
+              width="16" 
+              height="16" 
+              viewBox="0 0 24 24" 
+              fill="none" 
+              stroke="currentColor" 
+              stroke-width="2" 
+              stroke-linecap="round" 
+              stroke-linejoin="round"
+            >
               <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
               <path d="M3 3v5h5"/>
               <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
               <path d="M16 21h5v-5"/>
             </svg>
-            <span>Check for Updates</span>
+            <span>{updateState().checking ? "Checking..." : "Check for Updates"}</span>
           </button>
         </div>
       </aside>
@@ -296,9 +453,9 @@ export default function App() {
 
           <div class="welcome-banner">
             <div class="welcome-text">
-              <h2>✨ EduDash v1.0.6 with Fresh Light Theme</h2>
+              <h2>✨ EduDash v1.0.7 with Integrated Auto-Updater</h2>
               <p>
-                Manage schools, faculty, and students seamlessly with native Rust speed and customizable theme preferences.
+                Manage schools, faculty, and students seamlessly with native Rust speed, light and dark themes, and real-time auto-updates.
               </p>
             </div>
             <div class="quick-actions">
@@ -481,10 +638,9 @@ export default function App() {
             </Show>
           </div>
         </Show>
-
       </main>
 
-      {/* Modal Dialog */}
+      {/* Record Creation Modal */}
       <Show when={isModalOpen()}>
         <div class="dialog-backdrop" onClick={closeModal}>
           <div class="dialog-content" onClick={(e) => e.stopPropagation()}>
@@ -576,6 +732,133 @@ export default function App() {
                 <button type="submit" class="btn btn-primary">Save Record</button>
               </div>
             </form>
+          </div>
+        </div>
+      </Show>
+
+      {/* In-App Auto-Updater Modal Dialog */}
+      <Show when={updateState().isOpen}>
+        <div class="dialog-backdrop" onClick={closeUpdateModal}>
+          <div class="dialog-content update-modal-card" onClick={(e) => e.stopPropagation()}>
+            {/* Status: Checking */}
+            <Show when={updateState().status === "checking"}>
+              <div class="update-status-icon checking">
+                <svg class="spin-animation" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                  <path d="M3 3v5h5"/>
+                  <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                  <path d="M16 21h5v-5"/>
+                </svg>
+              </div>
+              <h2 class="update-title">Checking for Updates</h2>
+              <p class="update-description">Connecting to GitHub Releases to check for new version manifests...</p>
+              <div class="dialog-actions" style="justify-content: center;">
+                <button class="btn btn-secondary" onClick={closeUpdateModal}>Cancel</button>
+              </div>
+            </Show>
+
+            {/* Status: Already on Latest */}
+            <Show when={updateState().status === "latest"}>
+              <div class="update-status-icon latest">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M20 6L9 17l-5-5"/>
+                </svg>
+              </div>
+              <h2 class="update-title">You're Up to Date!</h2>
+              <p class="update-description">
+                EduDash is running the latest available release. No action is required.
+              </p>
+              <div class="dialog-actions" style="justify-content: center;">
+                <button class="btn btn-primary" onClick={closeUpdateModal}>Got It</button>
+              </div>
+            </Show>
+
+            {/* Status: Update Available */}
+            <Show when={updateState().status === "available"}>
+              <div class="update-status-icon available">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+                </svg>
+              </div>
+              <h2 class="update-title">Update Available: v{updateState().version}</h2>
+              <p class="update-description">
+                A new version has been released! Download and install to get the newest features and improvements.
+              </p>
+              <Show when={updateState().body}>
+                <div class="update-notes-box">
+                  <strong>What's New:</strong>
+                  <div style="margin-top: 0.35rem;">{updateState().body}</div>
+                </div>
+              </Show>
+              <div class="dialog-actions" style="justify-content: center; gap: 0.75rem;">
+                <button class="btn btn-secondary" onClick={closeUpdateModal}>Later</button>
+                <button class="btn btn-primary" onClick={handleInstallUpdate}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  <span>{updateState().isAndroid ? "Download APK" : "Download & Install"}</span>
+                </button>
+              </div>
+            </Show>
+
+            {/* Status: Downloading */}
+            <Show when={updateState().status === "downloading"}>
+              <div class="update-status-icon checking">
+                <svg class="spin-animation" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </div>
+              <h2 class="update-title">Downloading Update...</h2>
+              <p class="update-description">Downloading new version assets and verifying cryptographic signatures.</p>
+              <div class="update-progress-container">
+                <div class="update-progress-bar">
+                  <div class="update-progress-fill" style={{ width: `${updateState().progress || 0}%` }}></div>
+                </div>
+                <div class="update-progress-text">
+                  <span>Downloading...</span>
+                  <span>{updateState().progress || 0}%</span>
+                </div>
+              </div>
+            </Show>
+
+            {/* Status: Ready / Restarting */}
+            <Show when={updateState().status === "ready"}>
+              <div class="update-status-icon latest">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M20 6L9 17l-5-5"/>
+                </svg>
+              </div>
+              <h2 class="update-title">Update Installed!</h2>
+              <p class="update-description">
+                The update has been applied successfully. Please restart EduDash to enjoy the new version.
+              </p>
+              <div class="dialog-actions" style="justify-content: center;">
+                <button class="btn btn-primary" onClick={closeUpdateModal}>Done</button>
+              </div>
+            </Show>
+
+            {/* Status: Error */}
+            <Show when={updateState().status === "error"}>
+              <div class="update-status-icon error">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+              </div>
+              <h2 class="update-title">Update Check Failed</h2>
+              <p class="update-description" style="word-break: break-word;">
+                {updateState().errorMessage || "An unexpected error occurred while communicating with GitHub Releases."}
+              </p>
+              <div class="dialog-actions" style="justify-content: center; gap: 0.75rem;">
+                <button class="btn btn-secondary" onClick={closeUpdateModal}>Close</button>
+                <button class="btn btn-primary" onClick={() => checkForUpdates(false)}>Try Again</button>
+              </div>
+            </Show>
           </div>
         </div>
       </Show>
