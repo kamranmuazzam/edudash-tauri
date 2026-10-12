@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
-const CURRENT_APP_VERSION = "1.0.9";
+const CURRENT_APP_VERSION = "1.0.10";
 
 type View = "dashboard" | "schools" | "teachers" | "students";
 type Theme = "light" | "dark";
@@ -53,6 +53,22 @@ export default function App() {
   const toggleTheme = () => {
     setTheme(t => (t === "light" ? "dark" : "light"));
   };
+
+  // Zoom & Display Scale Controls (Persistent across sessions)
+  const storedZoom = (typeof window !== "undefined" && Number(localStorage.getItem("edudash-zoom"))) || 100;
+  const [zoomLevel, setZoomLevel] = createSignal<number>(storedZoom);
+
+  createEffect(() => {
+    const zoom = zoomLevel();
+    if (typeof document !== "undefined") {
+      document.documentElement.style.fontSize = `${(zoom / 100) * 16}px`;
+      localStorage.setItem("edudash-zoom", zoom.toString());
+    }
+  });
+
+  const zoomIn = () => setZoomLevel(z => Math.min(130, z + 10));
+  const zoomOut = () => setZoomLevel(z => Math.max(80, z - 10));
+  const resetZoom = () => setZoomLevel(100);
 
   // State to force re-fetch
   const [trigger, setTrigger] = createSignal(0);
@@ -328,11 +344,55 @@ export default function App() {
     <div class="app-container">
       {/* Sidebar */}
       <aside class="sidebar">
-        <div class="logo-container">
-          <div class="logo-icon">EDU</div>
-          <div class="logo-info">
-            <span class="logo-text">EduDash</span>
-            <span class="logo-version">v1.0.9</span>
+        <div class="sidebar-header-row">
+          <div class="logo-container">
+            <div class="logo-icon">EDU</div>
+            <div class="logo-info">
+              <span class="logo-text">EduDash</span>
+              <span class="logo-version">v{CURRENT_APP_VERSION}</span>
+            </div>
+          </div>
+
+          <div class="mobile-header-actions">
+            <div class="zoom-controls" title="Adjust display zoom">
+              <button class="zoom-btn" onClick={zoomOut} disabled={zoomLevel() <= 80} title="Zoom Out (Smaller text)">−</button>
+              <span class="zoom-label" onClick={resetZoom} title="Reset zoom">{zoomLevel()}%</span>
+              <button class="zoom-btn" onClick={zoomIn} disabled={zoomLevel() >= 130} title="Zoom In (Larger text)">+</button>
+            </div>
+
+            <button 
+              class="btn mobile-action-btn theme-toggle-btn"
+              onClick={toggleTheme}
+              title={`Switch to ${theme() === "light" ? "Dark" : "Light"} theme`}
+              aria-label="Toggle Theme"
+            >
+              <span>{theme() === "light" ? "☀️" : "🌙"}</span>
+            </button>
+
+            <button 
+              class="btn mobile-action-btn updater-btn"
+              onClick={() => checkForUpdates(false)}
+              disabled={updateState().checking}
+              title="Check for Updates"
+              aria-label="Check for Updates"
+            >
+              <svg 
+                class={updateState().checking ? "spin-animation" : ""}
+                width="16" 
+                height="16" 
+                viewBox="0 0 24 24" 
+                fill="none" 
+                stroke="currentColor" 
+                stroke-width="2" 
+                stroke-linecap="round" 
+                stroke-linejoin="round"
+              >
+                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                <path d="M3 3v5h5"/>
+                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                <path d="M16 21h5v-5"/>
+              </svg>
+            </button>
           </div>
         </div>
         
@@ -391,10 +451,18 @@ export default function App() {
           </button>
         </nav>
         
-        <div class="sidebar-footer">
-          <div class="system-status-pill">
-            <span class="status-dot"></span>
-            <span>System Online • v1.0.9</span>
+        <div class="sidebar-footer desktop-only">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.25rem;">
+            <div class="system-status-pill" style="margin-bottom: 0;">
+              <span class="status-dot"></span>
+              <span>Online • v{CURRENT_APP_VERSION}</span>
+            </div>
+
+            <div class="zoom-controls" title="Adjust display zoom">
+              <button class="zoom-btn" onClick={zoomOut} disabled={zoomLevel() <= 80} title="Zoom Out">−</button>
+              <span class="zoom-label" onClick={resetZoom} title="Reset zoom">{zoomLevel()}%</span>
+              <button class="zoom-btn" onClick={zoomIn} disabled={zoomLevel() >= 130} title="Zoom In">+</button>
+            </div>
           </div>
 
           <button 
@@ -454,7 +522,7 @@ export default function App() {
           </div>
           
           <Show when={currentView() !== "dashboard"}>
-            <div style="display: flex; align-items: center; gap: 0.75rem;">
+            <div class="page-header-actions">
               <div class="search-input-wrapper">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="11" cy="11" r="8"/>
@@ -537,7 +605,7 @@ export default function App() {
 
           <div class="welcome-banner">
             <div class="welcome-text">
-              <h2>✨ EduDash v1.0.9 - Fast & Stable Cross-Platform</h2>
+              <h2>✨ EduDash v1.0.10 - Fast & Stable Cross-Platform</h2>
               <p>
                 Manage schools, faculty, and students with real-time instant search, responsive light and dark themes, and high-performance Rust backend.
               </p>

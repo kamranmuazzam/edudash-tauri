@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "dashboard-app"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "serde",
  "serde_json",
