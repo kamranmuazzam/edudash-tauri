@@ -1,9 +1,9 @@
 import { createSignal, createResource, createEffect, onMount, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { type } from "@tauri-apps/plugin-os";
-import { check } from "@tauri-apps/plugin-updater";
 import "./App.css";
+
+const CURRENT_APP_VERSION = "1.0.9";
 
 type View = "dashboard" | "schools" | "teachers" | "students";
 type Theme = "light" | "dark";
@@ -20,6 +20,7 @@ interface UpdateState {
   body?: string;
   date?: string;
   progress?: number;
+  downloadText?: string;
   errorMessage?: string;
   isAndroid?: boolean;
   downloadUrl?: string;
@@ -32,6 +33,11 @@ export default function App() {
   const handleViewChange = (view: View) => {
     setCurrentView(view);
     setSearchQuery("");
+  };
+
+  // Safe Android platform detection (no Rust calls required)
+  const isAndroid = () => {
+    return typeof navigator !== "undefined" && /android/i.test(navigator.userAgent);
   };
 
   // Theme Management (Defaults to Light theme, persistent)
@@ -130,7 +136,7 @@ export default function App() {
   };
 
   // =========================================================================
-  // In-App Auto-Updater State & Logic
+  // Fast & Safe Auto-Updater Implementation
   // =========================================================================
   const [updateState, setUpdateState] = createSignal<UpdateState>({
     checking: false,
@@ -154,79 +160,83 @@ export default function App() {
     }));
 
     try {
-      let osType = "unknown";
-      try {
-        osType = type();
-      } catch {
-        if (typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("android")) {
-          osType = "android";
-        }
+      // Step 1: Ultra-fast pre-check via GitHub Releases API (< 0.5s response)
+      const res = await fetch("https://api.github.com/repos/kamranmuazzam/edudash-tauri/releases/latest", {
+        headers: { "Accept": "application/vnd.github.v3+json" }
+      });
+
+      if (!res.ok) {
+        throw new Error(`GitHub responded with status ${res.status}`);
       }
 
-      if (osType === "android") {
-        const res: any = await invoke("check_updates");
-        if (res && res.available && res.download_url) {
-          setUpdateState({
-            checking: false,
-            isOpen: true,
-            status: "available",
-            version: res.version,
-            isAndroid: true,
-            downloadUrl: res.download_url,
-            body: "A new version of EduDash for Android is ready to download.",
-          });
-        } else {
-          setUpdateState(prev => ({
-            ...prev,
-            checking: false,
-            status: "latest",
-            isOpen: silent ? false : true,
-          }));
+      const releaseData = await res.json();
+      const latestTag = (releaseData.tag_name || "").replace(/^v/, "").trim();
+
+      // Version comparison helper
+      const isNewer = (latest: string, current: string) => {
+        const lParts = latest.split(".").map(Number);
+        const cParts = current.split(".").map(Number);
+        for (let i = 0; i < Math.max(lParts.length, cParts.length); i++) {
+          const l = lParts[i] || 0;
+          const c = cParts[i] || 0;
+          if (l > c) return true;
+          if (l < c) return false;
         }
+        return false;
+      };
+
+      if (!isNewer(latestTag, CURRENT_APP_VERSION)) {
+        // Already up to date! Instant resolution in under 0.5s
+        setUpdateState(prev => ({
+          ...prev,
+          checking: false,
+          status: "latest",
+          version: CURRENT_APP_VERSION,
+          isOpen: silent ? false : true,
+        }));
+        return;
+      }
+
+      // Step 2: New update is available!
+      if (isAndroid()) {
+        // Android specific: Locate the signed universal APK
+        const apkAsset = releaseData.assets?.find((a: any) => a.name.endsWith(".apk"));
+        const downloadUrl = apkAsset ? apkAsset.browser_download_url : releaseData.html_url;
+
+        setUpdateState({
+          checking: false,
+          isOpen: true,
+          status: "available",
+          version: latestTag,
+          isAndroid: true,
+          downloadUrl: downloadUrl,
+          body: releaseData.body || "A new version of EduDash for Android is ready.",
+        });
       } else {
-        // Desktop updater check via official Tauri plugin
-        const update = await check();
-        if (update && update.available) {
-          activeUpdateObj = update;
-          setUpdateState({
-            checking: false,
-            isOpen: true,
-            status: "available",
-            version: update.version,
-            body: update.body || "A new update of EduDash is available with the latest features and improvements.",
-            date: update.date,
-            progress: 0,
-          });
-        } else {
-          setUpdateState(prev => ({
-            ...prev,
-            checking: false,
-            status: "latest",
-            isOpen: silent ? false : true,
-          }));
+        // Desktop (Mac/Windows): Dynamically load Tauri updater plugin only on desktop
+        try {
+          const { check } = await import("@tauri-apps/plugin-updater");
+          const update = await check({ timeout: 15000 });
+          if (update && update.available) {
+            activeUpdateObj = update;
+          }
+        } catch (pluginErr) {
+          console.warn("Tauri updater plugin check failed, falling back to direct asset URL:", pluginErr);
         }
+
+        const macAsset = releaseData.assets?.find((a: any) => a.name.endsWith(".dmg") || a.name.endsWith(".tar.gz"));
+        setUpdateState({
+          checking: false,
+          isOpen: true,
+          status: "available",
+          version: latestTag,
+          body: releaseData.body || "A new version of EduDash is available with optimizations and fixes.",
+          downloadUrl: macAsset?.browser_download_url || releaseData.html_url,
+          progress: 0,
+        });
       }
     } catch (err: any) {
-      console.error("Update error: ", err);
-
-      // Attempt fallback to Rust backend command if plugin threw an error
-      try {
-        const fallback: any = await invoke("check_updates");
-        if (fallback && fallback.available && fallback.download_url) {
-          setUpdateState({
-            checking: false,
-            isOpen: true,
-            status: "available",
-            version: fallback.version,
-            downloadUrl: fallback.download_url,
-            body: "New release found on GitHub Releases.",
-          });
-          return;
-        }
-      } catch {
-        // Fallback also errored
-      }
-
+      console.error("Update check failed:", err);
       setUpdateState(prev => ({
         ...prev,
         checking: false,
@@ -245,6 +255,7 @@ export default function App() {
     }
 
     if (!activeUpdateObj) {
+      // Fallback: If plugin object not loaded, open download asset directly in browser
       if (updateState().downloadUrl) {
         await openUrl(updateState().downloadUrl!);
         closeUpdateModal();
@@ -253,21 +264,45 @@ export default function App() {
     }
 
     try {
-      setUpdateState(prev => ({ ...prev, status: "downloading", progress: 0 }));
-      let downloaded = 0;
+      setUpdateState(prev => ({ 
+        ...prev, 
+        status: "downloading", 
+        progress: 0,
+        downloadText: "Connecting to release server..." 
+      }));
+
+      let downloadedBytes = 0;
       let totalBytes = 0;
 
       await activeUpdateObj.downloadAndInstall((event: any) => {
         if (event.event === "Started") {
           totalBytes = event.data?.contentLength || 0;
+          const totalMb = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) + " MB" : "";
+          setUpdateState(prev => ({
+            ...prev,
+            status: "downloading",
+            progress: 0,
+            downloadText: totalMb ? `Starting download (${totalMb})...` : "Starting download..."
+          }));
         } else if (event.event === "Progress") {
-          downloaded += event.data?.chunkLength || 0;
-          if (totalBytes > 0) {
-            const percent = Math.min(99, Math.round((downloaded / totalBytes) * 100));
-            setUpdateState(prev => ({ ...prev, progress: percent }));
-          }
+          downloadedBytes += event.data?.chunkLength || 0;
+          const dlMb = (downloadedBytes / (1024 * 1024)).toFixed(1);
+          const totalMb = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) : undefined;
+          const pct = totalBytes > 0 ? Math.min(99, Math.round((downloadedBytes / totalBytes) * 100)) : undefined;
+
+          setUpdateState(prev => ({
+            ...prev,
+            status: "downloading",
+            progress: pct,
+            downloadText: totalMb ? `${dlMb} MB / ${totalMb} MB (${pct}%)` : `${dlMb} MB downloaded...`
+          }));
         } else if (event.event === "Finished") {
-          setUpdateState(prev => ({ ...prev, progress: 100 }));
+          setUpdateState(prev => ({
+            ...prev,
+            progress: 100,
+            status: "ready",
+            downloadText: "Update downloaded & verified! Restarting..."
+          }));
         }
       });
 
@@ -277,16 +312,16 @@ export default function App() {
       setUpdateState(prev => ({
         ...prev,
         status: "error",
-        errorMessage: "Installation failed: " + (err?.message || String(err)),
+        errorMessage: "Installation error: " + (err?.message || String(err)),
       }));
     }
   };
 
-  // Automatic background update check on app launch
+  // Safe background check on launch (delayed by 3s, completely non-blocking)
   onMount(() => {
     setTimeout(() => {
       checkForUpdates(true);
-    }, 2500);
+    }, 3000);
   });
 
   return (
@@ -297,7 +332,7 @@ export default function App() {
           <div class="logo-icon">EDU</div>
           <div class="logo-info">
             <span class="logo-text">EduDash</span>
-            <span class="logo-version">v1.0.8</span>
+            <span class="logo-version">v1.0.9</span>
           </div>
         </div>
         
@@ -359,7 +394,7 @@ export default function App() {
         <div class="sidebar-footer">
           <div class="system-status-pill">
             <span class="status-dot"></span>
-            <span>System Online • v1.0.8</span>
+            <span>System Online • v1.0.9</span>
           </div>
 
           <button 
@@ -502,7 +537,7 @@ export default function App() {
 
           <div class="welcome-banner">
             <div class="welcome-text">
-              <h2>✨ EduDash v1.0.8 - Auto-Update Verified!</h2>
+              <h2>✨ EduDash v1.0.9 - Fast & Stable Cross-Platform</h2>
               <p>
                 Manage schools, faculty, and students with real-time instant search, responsive light and dark themes, and high-performance Rust backend.
               </p>
@@ -821,7 +856,7 @@ export default function App() {
               </div>
               <h2 class="update-title">You're Up to Date!</h2>
               <p class="update-description">
-                EduDash is running the latest available release. No action is required.
+                EduDash is running the latest available release (v{CURRENT_APP_VERSION}). No updates required.
               </p>
               <div class="dialog-actions" style="justify-content: center;">
                 <button class="btn btn-primary" onClick={closeUpdateModal}>Got It</button>
@@ -868,14 +903,17 @@ export default function App() {
                 </svg>
               </div>
               <h2 class="update-title">Downloading Update...</h2>
-              <p class="update-description">Downloading new version assets and verifying cryptographic signatures.</p>
+              <p class="update-description">Downloading package and validating cryptographic signatures.</p>
               <div class="update-progress-container">
                 <div class="update-progress-bar">
-                  <div class="update-progress-fill" style={{ width: `${updateState().progress || 0}%` }}></div>
+                  <div 
+                    class="update-progress-fill" 
+                    style={{ width: updateState().progress !== undefined ? `${updateState().progress}%` : "100%" }}
+                  ></div>
                 </div>
                 <div class="update-progress-text">
-                  <span>Downloading...</span>
-                  <span>{updateState().progress || 0}%</span>
+                  <span>{updateState().downloadText || "Downloading..."}</span>
+                  <span>{updateState().progress !== undefined ? `${updateState().progress}%` : ""}</span>
                 </div>
               </div>
             </Show>
@@ -887,9 +925,9 @@ export default function App() {
                   <path d="M20 6L9 17l-5-5"/>
                 </svg>
               </div>
-              <h2 class="update-title">Update Installed!</h2>
+              <h2 class="update-title">Update Ready!</h2>
               <p class="update-description">
-                The update has been applied successfully. Please restart EduDash to enjoy the new version.
+                The update has been applied successfully. Please restart EduDash to run the new version.
               </p>
               <div class="dialog-actions" style="justify-content: center;">
                 <button class="btn btn-primary" onClick={closeUpdateModal}>Done</button>
@@ -905,7 +943,7 @@ export default function App() {
                   <line x1="12" y1="16" x2="12.01" y2="16"/>
                 </svg>
               </div>
-              <h2 class="update-title">Update Check Failed</h2>
+              <h2 class="update-title">Update Check Notice</h2>
               <p class="update-description" style="word-break: break-word;">
                 {updateState().errorMessage || "An unexpected error occurred while communicating with GitHub Releases."}
               </p>

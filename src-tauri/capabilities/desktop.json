@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-updater",
+  "description": "Desktop auto-updater capability",
+  "windows": ["main", "*"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": [
+    "updater:default"
+  ]
+}

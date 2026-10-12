@@ -95,81 +95,24 @@ fn delete_student(id: usize, state: tauri::State<AppState>) {
     state.students.lock().unwrap().retain(|s| s.id != id);
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct UpdateStatus {
-    available: bool,
-    download_url: Option<String>,
-    version: Option<String>
-}
-
-#[derive(Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    assets: Vec<GithubAsset>,
-}
-
-#[derive(Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[tauri::command]
-async fn check_updates() -> Result<UpdateStatus, String> {
-    // Fixed actual GitHub repo!
-    let url = "https://api.github.com/repos/kamranmuazzam/edudash-tauri/releases/latest";
-    
-    let client = reqwest::Client::builder().user_agent("EduDashApp").build().map_err(|e| e.to_string())?;
-    let res = client.get(url).send().await;
-    
-    if let Ok(response) = res {
-        if response.status().is_success() {
-            let release: GithubRelease = response.json().await.map_err(|e| e.to_string())?;
-            let current_version = env!("CARGO_PKG_VERSION");
-            let latest_version = release.tag_name.trim_start_matches('v');
-            
-            if latest_version != current_version {
-                #[cfg(target_os = "android")]
-                let target_ext = ".apk";
-                #[cfg(target_os = "windows")]
-                let target_ext = ".exe";
-                #[cfg(target_os = "macos")]
-                let target_ext = ".tar.gz"; // or dmg
-                #[cfg(target_os = "linux")]
-                let target_ext = ".AppImage";
-
-                let asset = release.assets.into_iter().find(|a| a.name.ends_with(target_ext));
-                if let Some(a) = asset {
-                    return Ok(UpdateStatus {
-                        available: true,
-                        download_url: Some(a.browser_download_url),
-                        version: Some(latest_version.to_string())
-                    });
-                }
-            }
-        }
-    }
-    
-    Ok(UpdateStatus {
-        available: false,
-        download_url: None,
-        version: None
-    })
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_schools, add_school, delete_school,
             get_teachers, add_teacher, delete_teacher,
-            get_students, add_student, delete_student,
-            check_updates
-        ])
-        .run(tauri::generate_context!())
+            get_students, add_student, delete_student
+        ]);
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    builder.run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
