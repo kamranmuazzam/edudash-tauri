@@ -1,16 +1,55 @@
-import { createSignal, createResource, createEffect, onMount, For, Show } from "solid-js";
+import { createSignal, createResource, createEffect, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
-const CURRENT_APP_VERSION = "1.0.10";
+const CURRENT_APP_VERSION = "1.0.11";
 
-type View = "dashboard" | "schools" | "teachers" | "students";
+type View = "dashboard" | "schools" | "teachers" | "students" | "mesh";
 type Theme = "light" | "dark";
 
 interface Student { id: number; name: string; grade: string; school_id: number; }
 interface Teacher { id: number; name: string; subject: string; school_id: number; }
 interface School { id: number; name: string; address: string; }
+
+export interface NodeProfile {
+  peer_id: string;
+  device_name: string;
+  iroh_node_id: string;
+  local_ip: string;
+  tcp_port: number;
+  started_at: number;
+}
+
+export interface PeerInfo {
+  peer_id: string;
+  device_name: string;
+  ip_address: string;
+  tcp_port: number;
+  iroh_node_id: string;
+  last_seen_ts: number;
+  status: "online" | "syncing" | "offline";
+  records_count: number;
+  data_version: number;
+  latency_ms: number;
+}
+
+export interface NetworkActivity {
+  id: string;
+  title: string;
+  detail: string;
+  category: "peer" | "sync" | "message" | "system";
+  timestamp: number;
+}
+
+export interface SyncResult {
+  success: boolean;
+  peers_contacted: number;
+  added_records: number;
+  updated_records: number;
+  message: string;
+}
 
 interface UpdateState {
   checking: boolean;
@@ -73,6 +112,95 @@ export default function App() {
   // State to force re-fetch
   const [trigger, setTrigger] = createSignal(0);
   const refresh = () => setTrigger(t => t + 1);
+
+  // P2P Serverless Mesh & Sync State
+  const [nodeProfile, setNodeProfile] = createSignal<NodeProfile | null>(null);
+  const [peers, setPeers] = createSignal<PeerInfo[]>([]);
+  const [activities, setActivities] = createSignal<NetworkActivity[]>([]);
+  const [isSyncing, setIsSyncing] = createSignal(false);
+  const [broadcastMsg, setBroadcastMsg] = createSignal("");
+  const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+
+  const onlinePeers = () => peers().filter(p => p.status === "online");
+
+  let toastTimer: any = null;
+  const showToast = (msg: string) => {
+    if (toastTimer) clearTimeout(toastTimer);
+    setToastMessage(msg);
+    toastTimer = setTimeout(() => {
+      setToastMessage(null);
+    }, 4000);
+  };
+
+  const handleSyncMesh = async () => {
+    setIsSyncing(true);
+    try {
+      const res = await invoke<SyncResult>("sync_with_all_peers");
+      refresh();
+      showToast(res.message);
+      const [pList, actList] = await Promise.all([
+        invoke<PeerInfo[]>("get_online_peers"),
+        invoke<NetworkActivity[]>("get_network_activity"),
+      ]);
+      setPeers(pList);
+      setActivities(actList);
+    } catch (e: any) {
+      showToast(`Sync error: ${e?.message || e}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handleSyncPeer = async (peerId: string) => {
+    setIsSyncing(true);
+    try {
+      const res = await invoke<SyncResult>("sync_with_peer", { peerId });
+      refresh();
+      showToast(res.message);
+      const [pList, actList] = await Promise.all([
+        invoke<PeerInfo[]>("get_online_peers"),
+        invoke<NetworkActivity[]>("get_network_activity"),
+      ]);
+      setPeers(pList);
+      setActivities(actList);
+    } catch (e: any) {
+      showToast(`Sync error: ${e?.message || e}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handleSendBroadcast = async (e: Event) => {
+    e.preventDefault();
+    const msg = broadcastMsg().trim();
+    if (!msg) return;
+    try {
+      await invoke("broadcast_network_message", { content: msg });
+      setBroadcastMsg("");
+      showToast("Announcement broadcasted across the mesh!");
+      const actList = await invoke<NetworkActivity[]>("get_network_activity");
+      setActivities(actList);
+    } catch (e: any) {
+      showToast(`Broadcast failed: ${e?.message || e}`);
+    }
+  };
+
+  const copyText = (text: string, label: string) => {
+    if (navigator?.clipboard) {
+      navigator.clipboard.writeText(text);
+      showToast(`Copied ${label} to clipboard!`);
+    }
+  };
+
+  const formatTimeAgo = (ts: number) => {
+    if (!ts) return "Just now";
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - ts;
+    if (diff < 5) return "Just now";
+    if (diff < 60) return `${diff}s ago`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    return `${Math.floor(diff / 3600)}h ago`;
+  };
 
   // Resources (Fetching from Rust backend)
   const [students] = createResource(trigger, async () => {
@@ -333,11 +461,51 @@ export default function App() {
     }
   };
 
-  // Safe background check on launch (delayed by 3s, completely non-blocking)
+  // P2P Mesh Lifecycle & Events
   onMount(() => {
+    // Background check for app updates
     setTimeout(() => {
       checkForUpdates(true);
     }, 3000);
+
+    // Initial P2P State load
+    invoke<NodeProfile>("get_node_profile").then(setNodeProfile).catch(console.error);
+    invoke<PeerInfo[]>("get_online_peers").then(setPeers).catch(console.error);
+    invoke<NetworkActivity[]>("get_network_activity").then(setActivities).catch(console.error);
+
+    // Subscribe to backend P2P events
+    let cleanups: (() => void)[] = [];
+
+    listen<PeerInfo[]>("p2p://peer-list-updated", (event) => {
+      setPeers(event.payload);
+    }).then(u => cleanups.push(u));
+
+    listen<{ added: number; updated: number; source?: string }>("p2p://data-synced", (event) => {
+      refresh();
+      showToast(`⚡ Synced: +${event.payload.added || 0} added, ${event.payload.updated || 0} updated`);
+      invoke<PeerInfo[]>("get_online_peers").then(setPeers).catch(() => {});
+      invoke<NetworkActivity[]>("get_network_activity").then(setActivities).catch(() => {});
+    }).then(u => cleanups.push(u));
+
+    listen<NetworkActivity>("p2p://activity-logged", (event) => {
+      setActivities(prev => [event.payload, ...prev].slice(0, 50));
+    }).then(u => cleanups.push(u));
+
+    listen<{ sender: string; content: string }>("p2p://message-received", (event) => {
+      showToast(`💬 Broadcast from ${event.payload.sender}: "${event.payload.content}"`);
+      invoke<NetworkActivity[]>("get_network_activity").then(setActivities).catch(() => {});
+    }).then(u => cleanups.push(u));
+
+    // Periodic safety poll every 3 seconds
+    const interval = setInterval(() => {
+      invoke<PeerInfo[]>("get_online_peers").then(setPeers).catch(() => {});
+      invoke<NetworkActivity[]>("get_network_activity").then(setActivities).catch(() => {});
+    }, 3000);
+
+    onCleanup(() => {
+      clearInterval(interval);
+      cleanups.forEach(c => c());
+    });
   });
 
   return (
@@ -449,13 +617,40 @@ export default function App() {
             </span>
             <span>Students</span>
           </button>
+          <button 
+            class={`nav-item ${currentView() === "mesh" ? "active" : ""}`}
+            onClick={() => handleViewChange("mesh")}
+          >
+            <span class="nav-item-icon">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="18" cy="5" r="3"/>
+                <circle cx="6" cy="12" r="3"/>
+                <circle cx="18" cy="19" r="3"/>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+              </svg>
+            </span>
+            <span>Mesh & Peers</span>
+            <Show when={onlinePeers().length > 0}>
+              <span class="nav-peer-badge">{onlinePeers().length}</span>
+            </Show>
+          </button>
         </nav>
         
         <div class="sidebar-footer desktop-only">
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.25rem;">
-            <div class="system-status-pill" style="margin-bottom: 0;">
-              <span class="status-dot"></span>
-              <span>Online • v{CURRENT_APP_VERSION}</span>
+            <div 
+              class="system-status-pill" 
+              style="margin-bottom: 0; cursor: pointer;"
+              onClick={() => handleViewChange("mesh")}
+              title="Click to view P2P Mesh & Online Peers"
+            >
+              <span class={`status-dot ${onlinePeers().length > 0 ? "status-pulse" : ""}`}></span>
+              <span>
+                {onlinePeers().length > 0 
+                  ? `${onlinePeers().length} Peer${onlinePeers().length > 1 ? "s" : ""} Online` 
+                  : `Mesh Ready • v${CURRENT_APP_VERSION}`}
+              </span>
             </div>
 
             <div class="zoom-controls" title="Adjust display zoom">
@@ -512,17 +707,48 @@ export default function App() {
               {currentView() === "schools" && "Schools Management"}
               {currentView() === "teachers" && "Teachers Directory"}
               {currentView() === "students" && "Students Directory"}
+              {currentView() === "mesh" && "Serverless Mesh & Peers"}
             </h1>
             <p class="page-subtitle">
               {currentView() === "dashboard" && "Welcome back! Here is a summary of your educational database."}
               {currentView() === "schools" && "Create, monitor, and search educational institutions."}
               {currentView() === "teachers" && "View faculty profiles, search subjects taught, and manage schools."}
               {currentView() === "students" && "Keep track of active student enrollments, search names and grades."}
+              {currentView() === "mesh" && "Zero-configuration serverless peer discovery, real-time sync, and P2P messaging."}
             </p>
           </div>
           
-          <Show when={currentView() !== "dashboard"}>
-            <div class="page-header-actions">
+          <div class="page-header-actions">
+            <button 
+              class="mesh-header-pill" 
+              onClick={() => handleViewChange("mesh")}
+              title="View P2P Mesh Network status"
+            >
+              <span class={`status-dot ${onlinePeers().length > 0 ? "status-pulse" : ""}`}></span>
+              <span>
+                {onlinePeers().length > 0 
+                  ? `${onlinePeers().length} Peer${onlinePeers().length > 1 ? "s" : ""} Online` 
+                  : "Mesh Ready"}
+              </span>
+            </button>
+
+            <Show when={currentView() === "mesh"}>
+              <button 
+                class="mesh-sync-btn"
+                onClick={handleSyncMesh}
+                disabled={isSyncing()}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class={isSyncing() ? "spin-animation" : ""}>
+                  <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                  <path d="M3 3v5h5"/>
+                  <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                  <path d="M16 21h5v-5"/>
+                </svg>
+                <span>{isSyncing() ? "Syncing Mesh..." : "Sync All Peers"}</span>
+              </button>
+            </Show>
+
+            <Show when={currentView() !== "dashboard" && currentView() !== "mesh"}>
               <div class="search-input-wrapper">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="11" cy="11" r="8"/>
@@ -547,8 +773,8 @@ export default function App() {
                 </svg>
                 <span>Add New</span>
               </button>
-            </div>
-          </Show>
+            </Show>
+          </div>
         </header>
 
         {/* Dashboard View */}
@@ -601,18 +827,40 @@ export default function App() {
                 </svg>
               </div>
             </div>
+
+            <div class="summary-card" onClick={() => handleViewChange("mesh")} style="cursor: pointer;">
+              <div class="card-content">
+                <span class="card-title">Mesh Network</span>
+                <span class="card-value">{onlinePeers().length > 0 ? `${onlinePeers().length} Online` : "Active"}</span>
+                <div class="card-trend" style="color: var(--accent-success);">
+                  <span>{onlinePeers().length > 0 ? "P2P Real-time Sync" : "Zero-Config Discovery"}</span>
+                </div>
+              </div>
+              <div class="card-icon-wrapper card-icon-blue">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="18" cy="5" r="3"/>
+                  <circle cx="6" cy="12" r="3"/>
+                  <circle cx="18" cy="19" r="3"/>
+                  <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                  <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                </svg>
+              </div>
+            </div>
           </div>
 
           <div class="welcome-banner">
             <div class="welcome-text">
-              <h2>✨ EduDash v1.0.10 - Fast & Stable Cross-Platform</h2>
+              <h2>✨ EduDash v1.0.11 - Serverless P2P Synchronized</h2>
               <p>
-                Manage schools, faculty, and students with real-time instant search, responsive light and dark themes, and high-performance Rust backend.
+                Manage schools, faculty, and students with real-time automatic P2P sync across network peers, instant search, responsive light and dark themes, and high-performance Rust backend.
               </p>
             </div>
             <div class="quick-actions">
               <button class="btn btn-secondary" onClick={() => handleViewChange("schools")}>
                 View Schools
+              </button>
+              <button class="btn btn-secondary" onClick={() => handleViewChange("mesh")}>
+                🌐 Mesh Network ({onlinePeers().length})
               </button>
               <button class="btn btn-primary" onClick={() => openModal("add_student")}>
                 + Enroll Student
@@ -794,6 +1042,312 @@ export default function App() {
                 </tbody>
               </table>
             </Show>
+          </div>
+        </Show>
+
+        {/* Mesh & Peers View */}
+        <Show when={currentView() === "mesh"}>
+          <div class="mesh-view-container">
+            {/* Hero Header */}
+            <div class="mesh-banner-hero">
+              <div class="mesh-hero-text">
+                <h2>
+                  <span>🌐</span> Serverless P2P Mesh & Data Sync
+                </h2>
+                <p>
+                  Zero-configuration decentralized network. Discovers other running app instances on the local network or hotspot automatically via UDP Multicast and Iroh cryptographic identity, with instant bidirectional synchronization.
+                </p>
+              </div>
+              <div class="mesh-hero-actions">
+                <button 
+                  class="mesh-sync-btn"
+                  onClick={handleSyncMesh}
+                  disabled={isSyncing()}
+                >
+                  <svg 
+                    class={isSyncing() ? "spin-animation" : ""}
+                    width="16" 
+                    height="16" 
+                    viewBox="0 0 24 24" 
+                    fill="none" 
+                    stroke="currentColor" 
+                    stroke-width="2.5" 
+                    stroke-linecap="round" 
+                    stroke-linejoin="round"
+                  >
+                    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                    <path d="M3 3v5h5"/>
+                    <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                    <path d="M16 21h5v-5"/>
+                  </svg>
+                  <span>{isSyncing() ? "Synchronizing Mesh..." : "Sync Entire Mesh"}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Meta Cards: Node Identity + Network Health + Sync Status */}
+            <div class="mesh-meta-grid">
+              {/* Local Device Identity */}
+              <div class="mesh-meta-card">
+                <div class="mesh-card-header">
+                  <span class="mesh-card-label">Local Identity</span>
+                  <span class="badge badge-blue">This Device</span>
+                </div>
+                <div class="mesh-card-title">
+                  {nodeProfile()?.device_name || "Local Node"}
+                </div>
+                <div class="mesh-chip-group">
+                  <div class="mesh-chip-row">
+                    <span>Local Endpoint</span>
+                    <span class="mesh-chip-value">
+                      {nodeProfile()?.local_ip}:{nodeProfile()?.tcp_port}
+                    </span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Peer ID</span>
+                    <span class="mesh-chip-value">
+                      {nodeProfile() ? `${nodeProfile()!.peer_id.slice(0, 8)}...` : "—"}
+                      <button 
+                        class="chip-copy-btn" 
+                        onClick={() => copyText(nodeProfile()?.peer_id || "", "Peer ID")}
+                        title="Copy Peer ID"
+                      >
+                        Copy
+                      </button>
+                    </span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Iroh Cryptographic ID</span>
+                    <span class="mesh-chip-value">
+                      {nodeProfile() ? `${nodeProfile()!.iroh_node_id.slice(0, 10)}...` : "—"}
+                      <button 
+                        class="chip-copy-btn" 
+                        onClick={() => copyText(nodeProfile()?.iroh_node_id || "", "Iroh Node ID")}
+                        title="Copy Iroh Node ID"
+                      >
+                        Copy
+                      </button>
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Mesh Health */}
+              <div class="mesh-meta-card">
+                <div class="mesh-card-header">
+                  <span class="mesh-card-label">Mesh Health</span>
+                  <span class={`status-tag ${onlinePeers().length > 0 ? "peer-status-online" : "peer-status-offline"}`}>
+                    <span class={`status-dot ${onlinePeers().length > 0 ? "status-pulse" : ""}`}></span>
+                    {onlinePeers().length > 0 ? `${onlinePeers().length} Online` : "Listening"}
+                  </span>
+                </div>
+                <div class="mesh-card-title">
+                  {onlinePeers().length > 0 ? "Connected & Synchronized" : "Zero-Config Discovery Active"}
+                </div>
+                <div class="mesh-chip-group">
+                  <div class="mesh-chip-row">
+                    <span>Discovery Protocol</span>
+                    <span class="mesh-chip-value">UDP Multicast 239.255.42.99</span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Transport Engine</span>
+                    <span class="mesh-chip-value">Async TCP Swarm + Iroh</span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Heartbeat Beacon</span>
+                    <span class="mesh-chip-value">Every 2.5s (Auto-Sync)</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Data Store Status */}
+              <div class="mesh-meta-card">
+                <div class="mesh-card-header">
+                  <span class="mesh-card-label">Data Store</span>
+                  <span class="badge badge-emerald">In-Sync</span>
+                </div>
+                <div class="mesh-card-title">
+                  {(schools()?.length || 0) + (teachers()?.length || 0) + (students()?.length || 0)} Total Records
+                </div>
+                <div class="mesh-chip-group">
+                  <div class="mesh-chip-row">
+                    <span>Schools / Faculty / Scholars</span>
+                    <span class="mesh-chip-value">
+                      {schools()?.length || 0} / {teachers()?.length || 0} / {students()?.length || 0}
+                    </span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Conflict Resolution</span>
+                    <span class="mesh-chip-value">CRDT Vector + Tombstones</span>
+                  </div>
+                  <div class="mesh-chip-row">
+                    <span>Automatic Sync</span>
+                    <span class="mesh-chip-value" style="color: var(--accent-success);">
+                      Enabled (Sub-second)
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Peers List Section */}
+            <div class="peers-section">
+              <div class="section-title-row">
+                <h3 class="section-heading">
+                  <span>👥</span> Discovered Mesh Peers ({peers().length})
+                </h3>
+                <Show when={peers().length > 0}>
+                  <span class="badge badge-gray">{onlinePeers().length} of {peers().length} online</span>
+                </Show>
+              </div>
+
+              <Show 
+                when={peers().length > 0}
+                fallback={
+                  <div class="radar-empty-state">
+                    <div class="radar-pulse-ring">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="2"/>
+                        <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
+                      </svg>
+                    </div>
+                    <h3>Scanning for App Instances on the Mesh...</h3>
+                    <p>
+                      No other instances detected yet. Launch EduDash on another computer, mobile device, or open a second instance on this machine — they will automatically find each other and synchronize data without typing any ID!
+                    </p>
+                  </div>
+                }
+              >
+                <div class="peers-grid">
+                  <For each={peers()}>
+                    {(peer) => (
+                      <div class="peer-card">
+                        <div class="peer-card-top">
+                          <div class="peer-avatar">
+                            {peer.device_name.slice(0, 2).toUpperCase()}
+                          </div>
+                          <div class="peer-title-info">
+                            <span class="peer-name">{peer.device_name}</span>
+                            <span class="peer-endpoint-text">
+                              {peer.ip_address}:{peer.tcp_port}
+                            </span>
+                          </div>
+                          <span class={`peer-status-tag ${peer.status === "online" ? "peer-status-online" : "peer-status-offline"}`}>
+                            <span class={`status-dot ${peer.status === "online" ? "status-pulse" : ""}`}></span>
+                            {peer.status === "online" ? "Online" : "Offline"}
+                          </span>
+                        </div>
+
+                        <div class="peer-details-box">
+                          <div>
+                            <span class="peer-stat-label">Synced Records</span>
+                            <span class="peer-stat-val">{peer.records_count} items</span>
+                          </div>
+                          <div>
+                            <span class="peer-stat-label">Latency</span>
+                            <span class="peer-stat-val">
+                              {peer.latency_ms > 0 ? `${peer.latency_ms}ms` : "< 3ms"}
+                            </span>
+                          </div>
+                          <div>
+                            <span class="peer-stat-label">Data Version</span>
+                            <span class="peer-stat-val">v{peer.data_version}</span>
+                          </div>
+                          <div>
+                            <span class="peer-stat-label">Last Seen</span>
+                            <span class="peer-stat-val">
+                              {peer.status === "online" ? "Active now" : "Recently"}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div class="peer-actions-row">
+                          <button 
+                            class="peer-action-sync-btn"
+                            onClick={() => handleSyncPeer(peer.peer_id)}
+                            disabled={isSyncing() || peer.status !== "online"}
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                              <path d="M3 3v5h5"/>
+                              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                              <path d="M16 21h5v-5"/>
+                            </svg>
+                            <span>Sync With Peer</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+
+            {/* Broadcast Messaging Card */}
+            <div class="mesh-chat-card">
+              <div class="section-title-row">
+                <h3 class="section-heading">
+                  <span>💬</span> Broadcast Message to Mesh
+                </h3>
+                <span class="badge badge-gray">Instant P2P Announcement</span>
+              </div>
+              <form onSubmit={handleSendBroadcast} class="chat-input-row">
+                <input 
+                  type="text" 
+                  class="chat-input"
+                  placeholder="Type an announcement to all online peers... (e.g. 'Updated Grade 5 roster')"
+                  value={broadcastMsg()}
+                  onInput={(e) => setBroadcastMsg(e.target.value)}
+                />
+                <button type="submit" class="chat-send-btn" disabled={!broadcastMsg().trim()}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"/>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                  </svg>
+                  <span>Broadcast</span>
+                </button>
+              </form>
+            </div>
+
+            {/* Network Activity Log */}
+            <div class="mesh-meta-card">
+              <div class="section-title-row" style="margin-bottom: 0.5rem;">
+                <h3 class="section-heading">
+                  <span>📜</span> Mesh Activity Stream
+                </h3>
+                <span class="badge badge-gray">{activities().length} entries</span>
+              </div>
+              <div class="activity-list">
+                <Show 
+                  when={activities().length > 0}
+                  fallback={
+                    <div style="padding: 1.5rem; text-align: center; color: var(--text-muted); font-size: 0.85rem;">
+                      No mesh activity recorded yet. Events and synchronization logs will appear here.
+                    </div>
+                  }
+                >
+                  <For each={activities()}>
+                    {(act) => (
+                      <div class="activity-item">
+                        <div class={`activity-icon-badge activity-icon-${act.category}`}>
+                          {act.category === "peer" && "👥"}
+                          {act.category === "sync" && "⚡"}
+                          {act.category === "message" && "💬"}
+                          {act.category === "system" && "⚙️"}
+                        </div>
+                        <div class="activity-content">
+                          <div class="activity-title-row">
+                            <span class="activity-title">{act.title}</span>
+                            <span class="activity-time">{formatTimeAgo(act.timestamp)}</span>
+                          </div>
+                          <span class="activity-detail">{act.detail}</span>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
+            </div>
           </div>
         </Show>
       </main>
@@ -1021,6 +1575,14 @@ export default function App() {
               </div>
             </Show>
           </div>
+        </div>
+      </Show>
+
+      {/* Real-time P2P Floating Toast */}
+      <Show when={toastMessage()}>
+        <div class="p2p-toast-notification">
+          <span>🔔</span>
+          <span>{toastMessage()}</span>
         </div>
       </Show>
     </div>
