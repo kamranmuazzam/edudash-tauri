@@ -142,8 +142,13 @@ async fn test_two_nodes_discovery_and_bidirectional_sync() {
     s.push('\n');
     stream.write_all(s.as_bytes()).await.unwrap();
 
-    // Allow a few milliseconds for async apply
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait up to 1.5s for async TCP receive and DB merge
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if db2.lock().unwrap().students.len() >= 2 {
+            break;
+        }
+    }
 
     // Verify Node 2 has the new student
     {

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
-const CURRENT_APP_VERSION = "1.0.12";
+const CURRENT_APP_VERSION = "1.0.13";
 
 type View = "dashboard" | "schools" | "teachers" | "students" | "mesh";
 type Theme = "light" | "dark";

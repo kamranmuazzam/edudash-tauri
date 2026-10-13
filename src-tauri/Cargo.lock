@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "dashboard-app"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "futures-util",
  "gethostname",

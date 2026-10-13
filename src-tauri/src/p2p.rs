@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tauri::Emitter;
+use tauri::{async_runtime::spawn, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
@@ -260,7 +260,7 @@ impl P2pManager {
         // Launch Iroh Node async init
         let profile_clone = profile.clone();
         let manager_clone = manager.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             match iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await {
                 Ok(endpoint) => {
                     let node_id = endpoint.id().to_string();
@@ -344,7 +344,7 @@ impl P2pManager {
     }
 
     fn spawn_udp_discovery(self_arc: Arc<Self>) {
-        tokio::spawn(async move {
+        spawn(async move {
             // Setup dual-socket UDP: bind to 0.0.0.0:47888 with SO_REUSEPORT if possible,
             // or fallback to 0.0.0.0:0 while joining multicast group
             let socket = match Self::create_multicast_socket(DISCOVERY_PORT) {
@@ -482,7 +482,7 @@ impl P2pManager {
 
                 if should_sync {
                     let self_clone = Arc::new(self.clone_ref());
-                    tokio::spawn(async move {
+                    spawn(async move {
                         let _ = self_clone.sync_with_peer_internal(&ip_str, tcp_port).await;
                     });
                 }
@@ -604,7 +604,7 @@ impl P2pManager {
     }
 
     fn spawn_heartbeat_broadcaster(self_arc: Arc<Self>) {
-        tokio::spawn(async move {
+        spawn(async move {
             let send_socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => {
                     let _ = s.set_broadcast(true);
@@ -652,12 +652,12 @@ impl P2pManager {
     }
 
     fn spawn_tcp_server(self_arc: Arc<Self>, listener: TcpListener) {
-        tokio::spawn(async move {
+        spawn(async move {
             while self_arc.running.load(Ordering::Relaxed) {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let manager = self_arc.clone();
-                        tokio::spawn(async move {
+                        spawn(async move {
                             manager.handle_tcp_connection(stream).await;
                         });
                     }
@@ -799,7 +799,7 @@ impl P2pManager {
     }
 
     fn spawn_peer_monitor(self_arc: Arc<Self>) {
-        tokio::spawn(async move {
+        spawn(async move {
             while self_arc.running.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -833,7 +833,7 @@ impl P2pManager {
     }
 
     fn spawn_wan_mesh(self_arc: Arc<Self>) {
-        tokio::spawn(async move {
+        spawn(async move {
             let (my_peer_id, _device_name) = {
                 let prof = self_arc.profile.read().await;
                 (prof.peer_id.clone(), prof.device_name.clone())
@@ -870,7 +870,7 @@ impl P2pManager {
             // Spawn WAN periodic heartbeat task
             let client_hb = client.clone();
             let self_hb = self_arc.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 while self_hb.running.load(Ordering::Relaxed) {
                     let (prof, (data_ver, count)) = {
@@ -1000,7 +1000,7 @@ impl P2pManager {
 
                 if should_sync {
                     let self_clone = Arc::new(self.clone_ref());
-                    tokio::spawn(async move {
+                    spawn(async move {
                         let _ = self_clone.request_wan_sync(&peer_id).await;
                     });
                 }
@@ -1404,7 +1404,7 @@ impl P2pManager {
                 let _ = client
                     .publish(
                         TOPIC_BROADCAST_MUTATION,
-                        rumqttc::QoS::AtLeastOnce,
+                        rumqttc::QoS::AtMostOnce,
                         false,
                         bytes,
                     )
@@ -1442,7 +1442,7 @@ impl P2pManager {
             let port = peer.tcp_port;
             let payload = push_str.clone();
 
-            tokio::spawn(async move {
+            spawn(async move {
                 if let Ok(Ok(mut stream)) = tokio::time::timeout(
                     Duration::from_secs(3),
                     TcpStream::connect(format!("{}:{}", ip, port)),
@@ -1477,7 +1477,7 @@ impl P2pManager {
         if let Ok(bytes) = serde_json::to_vec(&wan_msg) {
             if let Some(client) = self.wan_client.read().await.as_ref() {
                 let _ = client
-                    .publish(TOPIC_BROADCAST_CHAT, rumqttc::QoS::AtLeastOnce, false, bytes)
+                    .publish(TOPIC_BROADCAST_CHAT, rumqttc::QoS::AtMostOnce, false, bytes)
                     .await;
             }
         }

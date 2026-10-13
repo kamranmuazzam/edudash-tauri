@@ -309,9 +309,13 @@ fn get_schools(state: tauri::State<AppState>) -> Vec<School> {
 }
 
 #[tauri::command]
-fn add_school(name: String, address: String, state: tauri::State<AppState>) -> School {
+async fn add_school(
+    name: String,
+    address: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<School, String> {
     let school = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let id = db.next_id();
         let school = School {
             id,
@@ -327,17 +331,17 @@ fn add_school(name: String, address: String, state: tauri::State<AppState>) -> S
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
 
-    school
+    Ok(school)
 }
 
 #[tauri::command]
-fn delete_school(id: usize, state: tauri::State<AppState>) {
+async fn delete_school(id: usize, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let tombstone = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let sync_id = db
             .schools
             .iter()
@@ -355,14 +359,18 @@ fn delete_school(id: usize, state: tauri::State<AppState>) {
     };
 
     if let Some(t) = tombstone {
-        state.db.lock().unwrap().tombstones.push(t);
+        if let Ok(mut db) = state.db.lock() {
+            db.tombstones.push(t);
+        }
     }
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -371,14 +379,14 @@ fn get_teachers(state: tauri::State<AppState>) -> Vec<Teacher> {
 }
 
 #[tauri::command]
-fn add_teacher(
+async fn add_teacher(
     name: String,
     subject: String,
     school_id: usize,
-    state: tauri::State<AppState>,
-) -> Teacher {
+    state: tauri::State<'_, AppState>,
+) -> Result<Teacher, String> {
     let teacher = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let id = db.next_id();
         let school_sync_id = db
             .schools
@@ -403,17 +411,17 @@ fn add_teacher(
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
 
-    teacher
+    Ok(teacher)
 }
 
 #[tauri::command]
-fn delete_teacher(id: usize, state: tauri::State<AppState>) {
+async fn delete_teacher(id: usize, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let tombstone = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let sync_id = db
             .teachers
             .iter()
@@ -431,14 +439,18 @@ fn delete_teacher(id: usize, state: tauri::State<AppState>) {
     };
 
     if let Some(t) = tombstone {
-        state.db.lock().unwrap().tombstones.push(t);
+        if let Ok(mut db) = state.db.lock() {
+            db.tombstones.push(t);
+        }
     }
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -447,14 +459,14 @@ fn get_students(state: tauri::State<AppState>) -> Vec<Student> {
 }
 
 #[tauri::command]
-fn add_student(
+async fn add_student(
     name: String,
     grade: String,
     school_id: usize,
-    state: tauri::State<AppState>,
-) -> Student {
+    state: tauri::State<'_, AppState>,
+) -> Result<Student, String> {
     let student = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let id = db.next_id();
         let school_sync_id = db
             .schools
@@ -479,17 +491,17 @@ fn add_student(
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
 
-    student
+    Ok(student)
 }
 
 #[tauri::command]
-fn delete_student(id: usize, state: tauri::State<AppState>) {
+async fn delete_student(id: usize, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let tombstone = {
-        let mut db = state.db.lock().unwrap();
+        let mut db = state.db.lock().map_err(|e| e.to_string())?;
         let sync_id = db
             .students
             .iter()
@@ -507,14 +519,18 @@ fn delete_student(id: usize, state: tauri::State<AppState>) {
     };
 
     if let Some(t) = tombstone {
-        state.db.lock().unwrap().tombstones.push(t);
+        if let Ok(mut db) = state.db.lock() {
+            db.tombstones.push(t);
+        }
     }
     state.save();
 
     let p2p = state.p2p.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         p2p.broadcast_mutation_push().await;
     });
+
+    Ok(())
 }
 
 // P2P / Serverless Mesh Commands
