@@ -1,6 +1,6 @@
 [package]
 name = "dashboard-app"
-version = "1.0.11"
+version = "1.0.12"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -26,9 +26,16 @@ tokio = { version = "1.53.2", features = ["full"] }
 local-ip-address = "0.6.13"
 socket2 = "0.6.5"
 gethostname = "1.1.0"
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
+reqwest = { version = "0.13", features = ["stream"] }
+futures-util = "0.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2.13.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.1"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

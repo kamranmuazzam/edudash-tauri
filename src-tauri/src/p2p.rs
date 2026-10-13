@@ -32,6 +32,16 @@ pub struct NodeProfile {
     pub started_at: u64,
 }
 
+pub fn default_network_type() -> String {
+    "lan".to_string()
+}
+
+pub const WAN_BROKER_HOST: &str = "broker.emqx.io";
+pub const WAN_BROKER_PORT: u16 = 1883;
+pub const TOPIC_HEARTBEAT: &str = "edudash/mesh/v1/heartbeat";
+pub const TOPIC_BROADCAST_MUTATION: &str = "edudash/mesh/v1/broadcast/mutation";
+pub const TOPIC_BROADCAST_CHAT: &str = "edudash/mesh/v1/broadcast/chat";
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PeerInfo {
     pub peer_id: String,
@@ -44,6 +54,8 @@ pub struct PeerInfo {
     pub records_count: usize,
     pub data_version: u64,
     pub latency_ms: u64,
+    #[serde(default = "default_network_type")]
+    pub network_type: String, // "lan" | "wan" | "hybrid"
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -139,6 +151,54 @@ pub enum TcpMessage {
     },
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum WanMessage {
+    #[serde(rename = "heartbeat")]
+    Heartbeat {
+        peer_id: String,
+        device_name: String,
+        iroh_node_id: String,
+        tcp_port: u16,
+        data_version: u64,
+        records_count: usize,
+        timestamp: u64,
+    },
+    #[serde(rename = "sync_request")]
+    SyncRequest {
+        from_peer_id: String,
+        from_device_name: String,
+        known_version: u64,
+    },
+    #[serde(rename = "sync_response")]
+    SyncResponse {
+        from_peer_id: String,
+        from_device_name: String,
+        schools: Vec<School>,
+        teachers: Vec<Teacher>,
+        students: Vec<Student>,
+        tombstones: Vec<Tombstone>,
+        data_version: u64,
+    },
+    #[serde(rename = "mutation_push")]
+    MutationPush {
+        from_peer_id: String,
+        schools: Vec<School>,
+        teachers: Vec<Teacher>,
+        students: Vec<Student>,
+        tombstones: Vec<Tombstone>,
+        data_version: u64,
+    },
+    #[serde(rename = "chat")]
+    Chat {
+        id: String,
+        peer_id: String,
+        sender_name: String,
+        content: String,
+        timestamp: u64,
+    },
+}
+
 pub struct P2pManager {
     pub profile: Arc<RwLock<NodeProfile>>,
     pub peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
@@ -148,6 +208,7 @@ pub struct P2pManager {
     pub app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     pub running: Arc<AtomicBool>,
     pub tcp_port: u16,
+    pub wan_client: Arc<RwLock<Option<rumqttc::AsyncClient>>>,
 }
 
 impl P2pManager {
@@ -193,6 +254,7 @@ impl P2pManager {
             app_handle: Arc::new(RwLock::new(app_handle)),
             running: Arc::new(AtomicBool::new(true)),
             tcp_port,
+            wan_client: Arc::new(RwLock::new(None)),
         });
 
         // Launch Iroh Node async init
@@ -241,6 +303,9 @@ impl P2pManager {
 
         // Start Peer Pruning & Health Monitor
         Self::spawn_peer_monitor(manager.clone());
+
+        // Start Global Serverless WAN Mesh (EMQX / MQTT)
+        Self::spawn_wan_mesh(manager.clone());
 
         Ok(manager)
     }
@@ -369,6 +434,9 @@ impl P2pManager {
                         existing.records_count = records_count;
                         existing.iroh_node_id = iroh_node_id.clone();
                         existing.latency_ms = latency_ms;
+                        if existing.network_type == "wan" {
+                            existing.network_type = "hybrid".to_string();
+                        }
 
                         // Check if version mismatch triggers auto-sync
                         let local_version = {
@@ -392,6 +460,7 @@ impl P2pManager {
                                 records_count,
                                 data_version,
                                 latency_ms,
+                                network_type: "lan".to_string(),
                             },
                         );
                         should_sync = true;
@@ -446,6 +515,9 @@ impl P2pManager {
                         existing.records_count = records_count;
                         existing.iroh_node_id = iroh_node_id;
                         existing.latency_ms = latency_ms;
+                        if existing.network_type == "wan" {
+                            existing.network_type = "hybrid".to_string();
+                        }
                         false
                     } else {
                         peers.insert(
@@ -461,6 +533,7 @@ impl P2pManager {
                                 records_count,
                                 data_version,
                                 latency_ms,
+                                network_type: "lan".to_string(),
                             },
                         );
                         true
@@ -737,11 +810,13 @@ impl P2pManager {
                     let mut peers = self_arc.peers.write().await;
                     peers.retain(|_id, peer| {
                         let age = now.saturating_sub(peer.last_seen_ts);
-                        if age > PEER_PRUNE_TIMEOUT_SECS {
+                        let prune_limit = if peer.network_type == "wan" { 60 } else { PEER_PRUNE_TIMEOUT_SECS };
+                        let offline_limit = if peer.network_type == "wan" { 15 } else { PEER_OFFLINE_TIMEOUT_SECS };
+                        if age > prune_limit {
                             changed = true;
                             false
                         } else {
-                            if age > PEER_OFFLINE_TIMEOUT_SECS && peer.status == "online" {
+                            if age > offline_limit && peer.status == "online" {
                                 peer.status = "offline".to_string();
                                 changed = true;
                             }
@@ -755,6 +830,360 @@ impl P2pManager {
                 }
             }
         });
+    }
+
+    fn spawn_wan_mesh(self_arc: Arc<Self>) {
+        tokio::spawn(async move {
+            let (my_peer_id, _device_name) = {
+                let prof = self_arc.profile.read().await;
+                (prof.peer_id.clone(), prof.device_name.clone())
+            };
+
+            let my_inbox_topic = format!("edudash/mesh/v1/peer/{}/inbox", my_peer_id);
+            let client_id = format!("edudash-{}", &my_peer_id[..10]);
+
+            let mut mqttoptions = rumqttc::MqttOptions::new(client_id, WAN_BROKER_HOST, WAN_BROKER_PORT);
+            mqttoptions.set_keep_alive(Duration::from_secs(30));
+            mqttoptions.set_clean_session(true);
+
+            let (client, mut eventloop) = rumqttc::AsyncClient::new(mqttoptions, 50);
+
+            {
+                let mut w = self_arc.wan_client.write().await;
+                *w = Some(client.clone());
+            }
+
+            self_arc
+                .add_activity(
+                    "Global WAN Mesh Connected",
+                    &format!("Connected to serverless broker ({}:{})", WAN_BROKER_HOST, WAN_BROKER_PORT),
+                    "system",
+                )
+                .await;
+
+            // Subscribe to mesh topics
+            let _ = client.subscribe(TOPIC_HEARTBEAT, rumqttc::QoS::AtLeastOnce).await;
+            let _ = client.subscribe(&my_inbox_topic, rumqttc::QoS::AtLeastOnce).await;
+            let _ = client.subscribe(TOPIC_BROADCAST_MUTATION, rumqttc::QoS::AtLeastOnce).await;
+            let _ = client.subscribe(TOPIC_BROADCAST_CHAT, rumqttc::QoS::AtLeastOnce).await;
+
+            // Spawn WAN periodic heartbeat task
+            let client_hb = client.clone();
+            let self_hb = self_arc.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                while self_hb.running.load(Ordering::Relaxed) {
+                    let (prof, (data_ver, count)) = {
+                        let p = self_hb.profile.read().await.clone();
+                        let db = self_hb.db.lock().unwrap();
+                        let c = db.schools.len() + db.teachers.len() + db.students.len();
+                        (p, (db.data_version, c))
+                    };
+
+                    let hb = WanMessage::Heartbeat {
+                        peer_id: prof.peer_id,
+                        device_name: prof.device_name,
+                        iroh_node_id: prof.iroh_node_id,
+                        tcp_port: prof.tcp_port,
+                        data_version: data_ver,
+                        records_count: count,
+                        timestamp: current_timestamp(),
+                    };
+
+                    if let Ok(bytes) = serde_json::to_vec(&hb) {
+                        let _ = client_hb
+                            .publish(TOPIC_HEARTBEAT, rumqttc::QoS::AtMostOnce, false, bytes)
+                            .await;
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                }
+            });
+
+            // Process incoming WAN messages from the event loop
+            while self_arc.running.load(Ordering::Relaxed) {
+                match eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                        let payload = publish.payload;
+                        if let Ok(msg) = serde_json::from_slice::<WanMessage>(&payload) {
+                            self_arc.handle_wan_message(msg).await;
+                        }
+                    }
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                        let _ = client.subscribe(TOPIC_HEARTBEAT, rumqttc::QoS::AtLeastOnce).await;
+                        let _ = client.subscribe(&my_inbox_topic, rumqttc::QoS::AtLeastOnce).await;
+                        let _ = client.subscribe(TOPIC_BROADCAST_MUTATION, rumqttc::QoS::AtLeastOnce).await;
+                        let _ = client.subscribe(TOPIC_BROADCAST_CHAT, rumqttc::QoS::AtLeastOnce).await;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    async fn handle_wan_message(&self, msg: WanMessage) {
+        let (my_peer_id, my_device_name) = {
+            let prof = self.profile.read().await;
+            (prof.peer_id.clone(), prof.device_name.clone())
+        };
+
+        match msg {
+            WanMessage::Heartbeat {
+                peer_id,
+                device_name,
+                iroh_node_id,
+                tcp_port: _,
+                data_version,
+                records_count,
+                timestamp,
+            } => {
+                if peer_id == my_peer_id {
+                    return; // Ignore own beacon
+                }
+
+                let now = current_timestamp();
+                let latency_ms = now.saturating_sub(timestamp) * 1000;
+                let mut is_new = false;
+                let mut should_sync = false;
+
+                {
+                    let mut peers = self.peers.write().await;
+                    if let Some(existing) = peers.get_mut(&peer_id) {
+                        existing.last_seen_ts = now;
+                        existing.status = "online".to_string();
+                        existing.data_version = data_version;
+                        existing.records_count = records_count;
+                        existing.iroh_node_id = iroh_node_id.clone();
+                        existing.latency_ms = latency_ms.min(999);
+                        if existing.network_type == "lan" {
+                            existing.network_type = "hybrid".to_string();
+                        }
+
+                        let local_version = self.db.lock().unwrap().data_version;
+                        if data_version != local_version {
+                            should_sync = true;
+                        }
+                    } else {
+                        is_new = true;
+                        peers.insert(
+                            peer_id.clone(),
+                            PeerInfo {
+                                peer_id: peer_id.clone(),
+                                device_name: device_name.clone(),
+                                ip_address: "Internet (Serverless Mesh)".to_string(),
+                                tcp_port: 0,
+                                iroh_node_id: iroh_node_id.clone(),
+                                last_seen_ts: now,
+                                status: "online".to_string(),
+                                records_count,
+                                data_version,
+                                latency_ms: latency_ms.min(999),
+                                network_type: "wan".to_string(),
+                            },
+                        );
+                        should_sync = true;
+                    }
+                }
+
+                if is_new {
+                    self.add_activity(
+                        "WAN Peer Discovered",
+                        &format!("{} online via global serverless mesh", device_name),
+                        "peer",
+                    )
+                    .await;
+                    self.emit_peer_list().await;
+                }
+
+                if should_sync {
+                    let self_clone = Arc::new(self.clone_ref());
+                    tokio::spawn(async move {
+                        let _ = self_clone.request_wan_sync(&peer_id).await;
+                    });
+                }
+            }
+            WanMessage::SyncRequest {
+                from_peer_id,
+                from_device_name: _,
+                known_version: _,
+            } => {
+                if from_peer_id == my_peer_id {
+                    return;
+                }
+
+                let payload = {
+                    let db = self.db.lock().unwrap();
+                    WanMessage::SyncResponse {
+                        from_peer_id: my_peer_id.clone(),
+                        from_device_name: my_device_name,
+                        schools: db.schools.clone(),
+                        teachers: db.teachers.clone(),
+                        students: db.students.clone(),
+                        tombstones: db.tombstones.clone(),
+                        data_version: db.data_version,
+                    }
+                };
+
+                let target_topic = format!("edudash/mesh/v1/peer/{}/inbox", from_peer_id);
+                if let Ok(bytes) = serde_json::to_vec(&payload) {
+                    if let Some(client) = self.wan_client.read().await.as_ref() {
+                        let _ = client
+                            .publish(target_topic, rumqttc::QoS::AtLeastOnce, false, bytes)
+                            .await;
+                    }
+                }
+            }
+            WanMessage::SyncResponse {
+                from_peer_id,
+                from_device_name,
+                schools,
+                teachers,
+                students,
+                tombstones,
+                data_version: _,
+            } => {
+                if from_peer_id == my_peer_id {
+                    return;
+                }
+
+                let inc_db = Database {
+                    schools,
+                    teachers,
+                    students,
+                    tombstones,
+                    next_id: 1,
+                    data_version: 0,
+                };
+
+                let (added, updated) = {
+                    let mut local = self.db.lock().unwrap();
+                    let changes = local.merge(&inc_db);
+                    drop(local);
+                    if changes.0 > 0 || changes.1 > 0 {
+                        self.save_local_db();
+                    }
+                    changes
+                };
+
+                if added > 0 || updated > 0 {
+                    self.emit_event(
+                        "p2p://data-synced",
+                        &serde_json::json!({
+                            "added": added,
+                            "updated": updated,
+                            "source": from_peer_id,
+                        }),
+                    );
+                    self.add_activity(
+                        "WAN Sync Completed",
+                        &format!("Merged +{} added, {} updated records from {}", added, updated, from_device_name),
+                        "sync",
+                    )
+                    .await;
+                }
+            }
+            WanMessage::MutationPush {
+                from_peer_id,
+                schools,
+                teachers,
+                students,
+                tombstones,
+                data_version: _,
+            } => {
+                if from_peer_id == my_peer_id {
+                    return;
+                }
+
+                let inc_db = Database {
+                    schools,
+                    teachers,
+                    students,
+                    tombstones,
+                    next_id: 1,
+                    data_version: 0,
+                };
+
+                let (added, updated) = {
+                    let mut local = self.db.lock().unwrap();
+                    let changes = local.merge(&inc_db);
+                    drop(local);
+                    if changes.0 > 0 || changes.1 > 0 {
+                        self.save_local_db();
+                    }
+                    changes
+                };
+
+                if added > 0 || updated > 0 {
+                    self.emit_event(
+                        "p2p://data-synced",
+                        &serde_json::json!({
+                            "added": added,
+                            "updated": updated,
+                            "source": from_peer_id,
+                        }),
+                    );
+                    self.add_activity(
+                        "Live WAN Update",
+                        &format!("Instantly merged +{} new and {} updated records via WAN", added, updated),
+                        "sync",
+                    )
+                    .await;
+                }
+            }
+            WanMessage::Chat {
+                id: _,
+                peer_id,
+                sender_name,
+                content,
+                timestamp: _,
+            } => {
+                if peer_id == my_peer_id {
+                    return;
+                }
+                self.add_activity(
+                    &format!("WAN Broadcast from {}", sender_name),
+                    &content,
+                    "message",
+                )
+                .await;
+                self.emit_event(
+                    "p2p://message-received",
+                    &serde_json::json!({
+                        "sender": sender_name,
+                        "content": content,
+                        "peer_id": peer_id,
+                    }),
+                );
+            }
+        }
+    }
+
+    pub async fn request_wan_sync(&self, target_peer_id: &str) -> bool {
+        let (my_id, my_name, local_ver) = {
+            let p = self.profile.read().await;
+            let v = self.db.lock().unwrap().data_version;
+            (p.peer_id.clone(), p.device_name.clone(), v)
+        };
+
+        let req = WanMessage::SyncRequest {
+            from_peer_id: my_id,
+            from_device_name: my_name,
+            known_version: local_ver,
+        };
+
+        let topic = format!("edudash/mesh/v1/peer/{}/inbox", target_peer_id);
+        if let Ok(bytes) = serde_json::to_vec(&req) {
+            if let Some(client) = self.wan_client.read().await.as_ref() {
+                return client
+                    .publish(topic, rumqttc::QoS::AtLeastOnce, false, bytes)
+                    .await
+                    .is_ok();
+            }
+        }
+        false
     }
 
     pub async fn emit_peer_list(&self) {
@@ -906,7 +1335,7 @@ impl P2pManager {
                 peers_contacted: 0,
                 added_records: 0,
                 updated_records: 0,
-                message: "No other peers currently online on the local mesh.".to_string(),
+                message: "No other peers currently online on the mesh.".to_string(),
             };
         }
 
@@ -915,14 +1344,20 @@ impl P2pManager {
         let mut contacted = 0;
 
         for peer in &online_peers {
-            match self.sync_with_peer_internal(&peer.ip_address, peer.tcp_port).await {
-                Ok((a, u)) => {
-                    total_added += a;
-                    total_updated += u;
+            if peer.network_type == "wan" || peer.tcp_port == 0 {
+                if self.request_wan_sync(&peer.peer_id).await {
                     contacted += 1;
                 }
-                Err(e) => {
-                    eprintln!("Error syncing with peer {}: {}", peer.device_name, e);
+            } else {
+                match self.sync_with_peer_internal(&peer.ip_address, peer.tcp_port).await {
+                    Ok((a, u)) => {
+                        total_added += a;
+                        total_updated += u;
+                        contacted += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Error syncing with peer {}: {}", peer.device_name, e);
+                    }
                 }
             }
         }
@@ -933,43 +1368,76 @@ impl P2pManager {
             added_records: total_added,
             updated_records: total_updated,
             message: format!(
-                "Successfully synchronized across {} peer(s). {} records added, {} updated.",
-                contacted, total_added, total_updated
+                "Successfully contacted {} peer(s) across LAN & WAN mesh.",
+                contacted
             ),
         }
     }
 
     pub async fn broadcast_mutation_push(&self) {
         let peers = self.get_peers_vec().await;
-        let online_peers: Vec<PeerInfo> = peers
+        let my_id = self.profile.read().await.peer_id.clone();
+
+        let (schools, teachers, students, tombstones, data_version) = {
+            let local = self.db.lock().unwrap();
+            (
+                local.schools.clone(),
+                local.teachers.clone(),
+                local.students.clone(),
+                local.tombstones.clone(),
+                local.data_version,
+            )
+        };
+
+        // 1. Broadcast over WAN broker to all peers across the internet
+        let wan_msg = WanMessage::MutationPush {
+            from_peer_id: my_id.clone(),
+            schools: schools.clone(),
+            teachers: teachers.clone(),
+            students: students.clone(),
+            tombstones: tombstones.clone(),
+            data_version,
+        };
+
+        if let Ok(bytes) = serde_json::to_vec(&wan_msg) {
+            if let Some(client) = self.wan_client.read().await.as_ref() {
+                let _ = client
+                    .publish(
+                        TOPIC_BROADCAST_MUTATION,
+                        rumqttc::QoS::AtLeastOnce,
+                        false,
+                        bytes,
+                    )
+                    .await;
+            }
+        }
+
+        // 2. Direct TCP push to LAN/hybrid peers
+        let lan_peers: Vec<PeerInfo> = peers
             .into_iter()
-            .filter(|p| p.status == "online")
+            .filter(|p| (p.network_type == "lan" || p.network_type == "hybrid") && p.status == "online" && p.tcp_port > 0)
             .collect();
 
-        if online_peers.is_empty() {
+        if lan_peers.is_empty() {
             return;
         }
 
-        let my_id = self.profile.read().await.peer_id.clone();
-        let push_msg = {
-            let local = self.db.lock().unwrap();
-            TcpMessage::PushData {
-                from_peer_id: my_id,
-                schools: local.schools.clone(),
-                teachers: local.teachers.clone(),
-                students: local.students.clone(),
-                tombstones: local.tombstones.clone(),
-                data_version: local.data_version,
-            }
+        let tcp_msg = TcpMessage::PushData {
+            from_peer_id: my_id,
+            schools,
+            teachers,
+            students,
+            tombstones,
+            data_version,
         };
 
-        let mut push_str = match serde_json::to_string(&push_msg) {
+        let mut push_str = match serde_json::to_string(&tcp_msg) {
             Ok(s) => s,
             Err(_) => return,
         };
         push_str.push('\n');
 
-        for peer in online_peers {
+        for peer in lan_peers {
             let ip = peer.ip_address.clone();
             let port = peer.tcp_port;
             let payload = push_str.clone();
@@ -997,11 +1465,28 @@ impl P2pManager {
         let chat_id = uuid::Uuid::new_v4().to_string();
         let now = current_timestamp();
 
-        // Broadcast over UDP
-        let udp_msg = DiscoveryMessage::BroadcastMessage {
+        // 1. Broadcast over WAN broker
+        let wan_msg = WanMessage::Chat {
             id: chat_id.clone(),
             peer_id: prof.peer_id.clone(),
             sender_name: prof.device_name.clone(),
+            content: content.to_string(),
+            timestamp: now,
+        };
+
+        if let Ok(bytes) = serde_json::to_vec(&wan_msg) {
+            if let Some(client) = self.wan_client.read().await.as_ref() {
+                let _ = client
+                    .publish(TOPIC_BROADCAST_CHAT, rumqttc::QoS::AtLeastOnce, false, bytes)
+                    .await;
+            }
+        }
+
+        // 2. Broadcast over local UDP
+        let udp_msg = DiscoveryMessage::BroadcastMessage {
+            id: chat_id,
+            peer_id: prof.peer_id,
+            sender_name: prof.device_name,
             content: content.to_string(),
             timestamp: now,
         };
@@ -1020,12 +1505,8 @@ impl P2pManager {
             }
         }
 
-        self.add_activity(
-            "Sent Peer Broadcast",
-            content,
-            "message",
-        )
-        .await;
+        self.add_activity("Sent Broadcast Message", content, "message")
+            .await;
 
         true
     }
@@ -1051,6 +1532,7 @@ impl P2pManager {
             app_handle: self.app_handle.clone(),
             running: self.running.clone(),
             tcp_port: self.tcp_port,
+            wan_client: self.wan_client.clone(),
         }
     }
 }

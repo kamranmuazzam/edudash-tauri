@@ -192,3 +192,94 @@ async fn test_udp_heartbeat_discovery() {
 
     println!("Discovery result: {}", discovered);
 }
+
+#[tokio::test]
+async fn test_wan_message_handling() {
+    use dashboard_app_lib::p2p::WanMessage;
+
+    let tmp = std::env::temp_dir();
+    let file = tmp.join(format!("wan_db_{}.json", uuid::Uuid::new_v4()));
+    let db = Arc::new(Mutex::new(Database::default()));
+    let node = P2pManager::start(db.clone(), file, None).await.unwrap();
+
+    let remote_peer_id = format!("remote-peer-{}", uuid::Uuid::new_v4());
+
+    // 1. Simulate incoming WAN Heartbeat from a remote peer across the internet
+    let wan_hb = WanMessage::Heartbeat {
+        peer_id: remote_peer_id.clone(),
+        device_name: "Cloud-Node-Berlin".to_string(),
+        iroh_node_id: "iroh-cloud-test-key".to_string(),
+        tcp_port: 0,
+        data_version: 5,
+        records_count: 10,
+        timestamp: dashboard_app_lib::current_timestamp(),
+    };
+
+    // Serialize to bytes (as would arrive from MQTT broker) and deserialize
+    let payload_bytes = serde_json::to_vec(&wan_hb).expect("Failed to serialize WAN heartbeat");
+    let deserialized: WanMessage = serde_json::from_slice(&payload_bytes).expect("Failed to deserialize WAN heartbeat");
+
+    // Manually register as peer to verify PeerInfo attributes
+    {
+        let mut peers = node.peers.write().await;
+        if let WanMessage::Heartbeat { peer_id, device_name, iroh_node_id, data_version, records_count, .. } = deserialized {
+            peers.insert(
+                peer_id.clone(),
+                dashboard_app_lib::p2p::PeerInfo {
+                    peer_id,
+                    device_name,
+                    ip_address: "Internet (Serverless Mesh)".to_string(),
+                    tcp_port: 0,
+                    iroh_node_id,
+                    last_seen_ts: dashboard_app_lib::current_timestamp(),
+                    status: "online".to_string(),
+                    records_count,
+                    data_version,
+                    latency_ms: 25,
+                    network_type: "wan".to_string(),
+                },
+            );
+        }
+    }
+
+    let peers = node.get_peers_vec().await;
+    assert!(peers.iter().any(|p| p.peer_id == remote_peer_id && p.network_type == "wan"));
+    println!("WAN peer registered successfully with network_type = 'wan'!");
+
+    // 2. Simulate incoming WAN MutationPush
+    let mutation = WanMessage::MutationPush {
+        from_peer_id: remote_peer_id.clone(),
+        schools: vec![School {
+            id: 10,
+            sync_id: "school-wan-10".to_string(),
+            name: "Global WAN Virtual High".to_string(),
+            address: "Cloud Gateway".to_string(),
+            updated_at: 5000,
+        }],
+        teachers: vec![],
+        students: vec![],
+        tombstones: vec![],
+        data_version: 5,
+    };
+
+    let mutation_bytes = serde_json::to_vec(&mutation).unwrap();
+    let parsed_mutation: WanMessage = serde_json::from_slice(&mutation_bytes).unwrap();
+
+    if let WanMessage::MutationPush { schools, teachers, students, tombstones, .. } = parsed_mutation {
+        let incoming_db = Database {
+            schools,
+            teachers,
+            students,
+            tombstones,
+            next_id: 1,
+            data_version: 0,
+        };
+        let mut local = db.lock().unwrap();
+        let (added, updated) = local.merge(&incoming_db);
+        assert_eq!(added, 1, "Should have merged 1 new school from WAN mutation");
+        assert_eq!(updated, 0);
+        assert!(local.schools.iter().any(|s| s.sync_id == "school-wan-10"));
+    }
+
+    println!("WAN mutation push merge verified successfully!");
+}

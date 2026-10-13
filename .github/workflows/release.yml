@@ -67,7 +67,12 @@ jobs:
 
       - name: Init Android Project (Android only)
         if: matrix.target == 'android'
-        run: npm run tauri android init
+        run: |
+          npm run tauri android init
+          # Ensure permissions for in-app update package installer and internet are present in AndroidManifest.xml
+          if [ -f "src-tauri/gen/android/app/src/main/AndroidManifest.xml" ]; then
+            sed -i '/<application/i \    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />' src-tauri/gen/android/app/src/main/AndroidManifest.xml || true
+          fi
 
       # Build Mac & Windows
       - name: Build Desktop App

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
-const CURRENT_APP_VERSION = "1.0.11";
+const CURRENT_APP_VERSION = "1.0.12";
 
 type View = "dashboard" | "schools" | "teachers" | "students" | "mesh";
 type Theme = "light" | "dark";
@@ -33,6 +33,7 @@ export interface PeerInfo {
   records_count: number;
   data_version: number;
   latency_ms: number;
+  network_type?: "lan" | "wan" | "hybrid";
 }
 
 export interface NetworkActivity {
@@ -63,6 +64,7 @@ interface UpdateState {
   errorMessage?: string;
   isAndroid?: boolean;
   downloadUrl?: string;
+  downloadedApkPath?: string;
 }
 
 export default function App() {
@@ -393,8 +395,55 @@ export default function App() {
 
   const handleInstallUpdate = async () => {
     if (updateState().isAndroid && updateState().downloadUrl) {
-      await openUrl(updateState().downloadUrl!);
-      closeUpdateModal();
+      setUpdateState(prev => ({
+        ...prev,
+        status: "downloading",
+        progress: 0,
+        downloadText: "Connecting to release server...",
+      }));
+
+      let unlistenProgress: (() => void) | undefined;
+      try {
+        unlistenProgress = await listen<{ downloaded: number; total: number; percentage: number; status: string }>(
+          "tauri://download-progress",
+          (event) => {
+            const { downloaded, total, percentage } = event.payload;
+            const dlMb = (downloaded / (1024 * 1024)).toFixed(1);
+            const totalMb = total > 0 ? (total / (1024 * 1024)).toFixed(1) : undefined;
+            setUpdateState(prev => ({
+              ...prev,
+              status: "downloading",
+              progress: percentage,
+              downloadText: totalMb ? `${dlMb} MB / ${totalMb} MB (${percentage}%)` : `${dlMb} MB downloaded...`,
+            }));
+          }
+        );
+
+        const apkPath = await invoke<string>("download_android_apk", { url: updateState().downloadUrl! });
+
+        setUpdateState(prev => ({
+          ...prev,
+          status: "ready",
+          progress: 100,
+          downloadedApkPath: apkPath,
+          downloadText: "APK downloaded! Launching Android package installer...",
+        }));
+
+        try {
+          await invoke("install_android_apk", { filePath: apkPath });
+        } catch (instErr) {
+          console.warn("Direct package installer launch notice:", instErr);
+        }
+      } catch (err: any) {
+        console.error("Android in-app update download failed:", err);
+        setUpdateState(prev => ({
+          ...prev,
+          status: "error",
+          errorMessage: "Android update error: " + (err?.message || String(err)),
+        }));
+      } finally {
+        if (unlistenProgress) unlistenProgress();
+      }
       return;
     }
 
@@ -458,6 +507,21 @@ export default function App() {
         status: "error",
         errorMessage: "Installation error: " + (err?.message || String(err)),
       }));
+    }
+  };
+
+  const handleLaunchApkAgain = async () => {
+    const path = updateState().downloadedApkPath;
+    if (path) {
+      try {
+        await invoke("install_android_apk", { filePath: path });
+      } catch (e) {
+        if (updateState().downloadUrl) {
+          await openUrl(updateState().downloadUrl!);
+        }
+      }
+    } else if (updateState().downloadUrl) {
+      await openUrl(updateState().downloadUrl!);
     }
   };
 
@@ -1147,15 +1211,15 @@ export default function App() {
                 <div class="mesh-chip-group">
                   <div class="mesh-chip-row">
                     <span>Discovery Protocol</span>
-                    <span class="mesh-chip-value">UDP Multicast 239.255.42.99</span>
+                    <span class="mesh-chip-value">UDP Multicast + Serverless WAN Mesh</span>
                   </div>
                   <div class="mesh-chip-row">
                     <span>Transport Engine</span>
-                    <span class="mesh-chip-value">Async TCP Swarm + Iroh</span>
+                    <span class="mesh-chip-value">Direct TCP Swarm + EMQX PubSub</span>
                   </div>
                   <div class="mesh-chip-row">
                     <span>Heartbeat Beacon</span>
-                    <span class="mesh-chip-value">Every 2.5s (Auto-Sync)</span>
+                    <span class="mesh-chip-value">Auto-Sync (Sub-Second)</span>
                   </div>
                 </div>
               </div>
@@ -1183,7 +1247,7 @@ export default function App() {
                   <div class="mesh-chip-row">
                     <span>Automatic Sync</span>
                     <span class="mesh-chip-value" style="color: var(--accent-success);">
-                      Enabled (Sub-second)
+                      Enabled (LAN & Internet)
                     </span>
                   </div>
                 </div>
@@ -1213,7 +1277,7 @@ export default function App() {
                     </div>
                     <h3>Scanning for App Instances on the Mesh...</h3>
                     <p>
-                      No other instances detected yet. Launch EduDash on another computer, mobile device, or open a second instance on this machine — they will automatically find each other and synchronize data without typing any ID!
+                      No other instances detected yet. Launch EduDash on another computer, mobile device, or anywhere in the world on the internet — they will automatically find each other and synchronize data without typing any ID!
                     </p>
                   </div>
                 }
@@ -1227,9 +1291,14 @@ export default function App() {
                             {peer.device_name.slice(0, 2).toUpperCase()}
                           </div>
                           <div class="peer-title-info">
-                            <span class="peer-name">{peer.device_name}</span>
+                            <div style="display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">
+                              <span class="peer-name">{peer.device_name}</span>
+                              <span class={`badge ${peer.network_type === "wan" ? "badge-blue" : peer.network_type === "hybrid" ? "badge-emerald" : "badge-gray"}`} style="font-size: 0.65rem; padding: 0.1rem 0.35rem;">
+                                {peer.network_type === "wan" ? "WAN (Internet)" : peer.network_type === "hybrid" ? "LAN + WAN" : "LAN (Wi-Fi)"}
+                              </span>
+                            </div>
                             <span class="peer-endpoint-text">
-                              {peer.ip_address}:{peer.tcp_port}
+                              {peer.network_type === "wan" ? "Global Serverless Mesh" : `${peer.ip_address}:${peer.tcp_port}`}
                             </span>
                           </div>
                           <span class={`peer-status-tag ${peer.status === "online" ? "peer-status-online" : "peer-status-offline"}`}>
@@ -1510,7 +1579,7 @@ export default function App() {
                     <polyline points="7 10 12 15 17 10"/>
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
-                  <span>{updateState().isAndroid ? "Download APK" : "Download & Install"}</span>
+                  <span>Download & Install</span>
                 </button>
               </div>
             </Show>
@@ -1525,7 +1594,9 @@ export default function App() {
                 </svg>
               </div>
               <h2 class="update-title">Downloading Update...</h2>
-              <p class="update-description">Downloading package and validating cryptographic signatures.</p>
+              <p class="update-description">
+                {updateState().isAndroid ? "Downloading Android package directly inside EduDash..." : "Downloading package and validating cryptographic signatures."}
+              </p>
               <div class="update-progress-container">
                 <div class="update-progress-bar">
                   <div 
@@ -1547,13 +1618,32 @@ export default function App() {
                   <path d="M20 6L9 17l-5-5"/>
                 </svg>
               </div>
-              <h2 class="update-title">Update Ready!</h2>
-              <p class="update-description">
-                The update has been applied successfully. Please restart EduDash to run the new version.
-              </p>
-              <div class="dialog-actions" style="justify-content: center;">
-                <button class="btn btn-primary" onClick={closeUpdateModal}>Done</button>
-              </div>
+              <Show when={updateState().isAndroid}>
+                <h2 class="update-title">Update Ready to Install!</h2>
+                <p class="update-description">
+                  {updateState().downloadText || "Package downloaded. The Android package installer should launch. If it did not open automatically, tap below."}
+                </p>
+                <div class="dialog-actions" style="justify-content: center; gap: 0.75rem;">
+                  <button class="btn btn-secondary" onClick={closeUpdateModal}>Close</button>
+                  <button class="btn btn-primary" onClick={handleLaunchApkAgain}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                      <polyline points="7 10 12 15 17 10"/>
+                      <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    <span>Open Installer</span>
+                  </button>
+                </div>
+              </Show>
+              <Show when={!updateState().isAndroid}>
+                <h2 class="update-title">Update Ready!</h2>
+                <p class="update-description">
+                  The update has been applied successfully. Please restart EduDash to run the new version.
+                </p>
+                <div class="dialog-actions" style="justify-content: center;">
+                  <button class="btn btn-primary" onClick={closeUpdateModal}>Done</button>
+                </div>
+              </Show>
             </Show>
 
             {/* Status: Error */}
